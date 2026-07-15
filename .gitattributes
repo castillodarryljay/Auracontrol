@@ -1,0 +1,9 @@
+# Treat files as text by default, let Git handle line endings automatically
+* text=auto
+
+# Explicitly mark binary files so they are never touched or corrupted by line ending conversions
+*.jar binary
+*.png binary
+*.webp binary
+*.apk binary
+*.keystore binary
