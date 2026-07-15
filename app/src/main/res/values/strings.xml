@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">AuraControl</string>
+    <string name="accessibility_service_description">Enables touchless hand gestures to trigger navigation controls like Back, Home, Recents, and Scrolling.</string>
+</resources>

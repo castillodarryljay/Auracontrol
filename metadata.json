@@ -1,0 +1,6 @@
+{
+  "name": "AuraControl",
+  "description": "Touchless hand gesture tracking via front camera for background device navigation and media control.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
