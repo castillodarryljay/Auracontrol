@@ -43,6 +43,11 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.Typeface
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -617,6 +622,39 @@ fun PlaygroundScreen(viewModel: MainViewModel) {
     var showGestureFlash by remember { mutableStateOf(false) }
     var flashedGestureName by remember { mutableStateOf("") }
 
+    val textPaint = remember {
+        android.graphics.Paint().apply {
+            color = android.graphics.Color.WHITE
+            textSize = 34f
+            isAntiAlias = true
+            textAlign = android.graphics.Paint.Align.CENTER
+            typeface = android.graphics.Typeface.create(android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.BOLD)
+        }
+    }
+    val labelBgPaint = remember {
+        android.graphics.Paint().apply {
+            color = android.graphics.Color.parseColor("#E60F172A") // Slate 900
+            style = android.graphics.Paint.Style.FILL
+            isAntiAlias = true
+        }
+    }
+    val labelBorderPaint = remember {
+        android.graphics.Paint().apply {
+            color = android.graphics.Color.parseColor("#A8C7FA") // Tech blue border
+            style = android.graphics.Paint.Style.STROKE
+            strokeWidth = 3f
+            isAntiAlias = true
+        }
+    }
+    val leaderLinePaint = remember {
+        android.graphics.Paint().apply {
+            color = android.graphics.Color.parseColor("#00FF87") // Neon green leader line
+            style = android.graphics.Paint.Style.STROKE
+            strokeWidth = 4f
+            isAntiAlias = true
+        }
+    }
+
     LaunchedEffect(lastGesture) {
         if (lastGesture != "None" && lastGesture.isNotEmpty()) {
             flashedGestureName = lastGesture
@@ -686,48 +724,35 @@ fun PlaygroundScreen(viewModel: MainViewModel) {
                     .background(Color(0xFF0F0F12))
             ) {
                 if (isServiceRunning) {
+                    var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
+                    
+                    DisposableEffect(previewViewRef) {
+                        val view = previewViewRef
+                        if (view != null) {
+                            GestureService.registerPreview(view)
+                        }
+                        onDispose {
+                            if (view != null) {
+                                GestureService.unregisterPreview(view)
+                            }
+                        }
+                    }
+
                     AndroidView(
                         factory = { ctx ->
                             PreviewView(ctx).apply {
                                 scaleType = PreviewView.ScaleType.FILL_CENTER
                                 implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                                previewViewRef = this
                             }
                         },
-                        update = { previewView ->
-                            try {
-                                GestureService.previewUseCase?.setSurfaceProvider(previewView.surfaceProvider)
-                            } catch (e: Exception) {
-                                android.util.Log.e("MainActivity", "Failed to set surface provider", e)
-                            }
-                        },
+                        update = { },
                         modifier = Modifier.fillMaxSize()
                     )
                 }
 
                 // Background futuristic coordinate grid drawing
                 Canvas(modifier = Modifier.fillMaxSize()) {
-                    val cols = 24
-                    val rows = 18
-                    val cellW = size.width / cols
-                    val cellH = size.height / rows
-
-                    // Draw motion grid heatmap pixels
-                    for (gy in 0 until rows) {
-                        for (gx in 0 until cols) {
-                            val index = gy * cols + gx
-                            if (index < motionGrid.size) {
-                                val intensity = motionGrid[index]
-                                if (intensity > 0f) {
-                                    drawRect(
-                                        color = Color(0xFFA8C7FA).copy(alpha = (intensity * 1.5f).coerceIn(0f, 1f)),
-                                        topLeft = androidx.compose.ui.geometry.Offset(gx * cellW, gy * cellH),
-                                        size = androidx.compose.ui.geometry.Size(cellW, cellH)
-                                    )
-                                }
-                            }
-                        }
-                    }
-
                     // Draw futuristic hand tracking skeleton
                     handSkeleton?.let { skeleton ->
                         if (skeleton.size >= 42) {
@@ -800,42 +825,69 @@ fun PlaygroundScreen(viewModel: MainViewModel) {
                                     )
                                 }
                             }
+
+                            // Draw specific finger HUD labels for Thumb and Pointer/Index
+                            val thumbTipX = skeleton[4 * 2] * size.width
+                            val thumbTipY = skeleton[4 * 2 + 1] * size.height
+
+                            val pointerTipX = skeleton[8 * 2] * size.width
+                            val pointerTipY = skeleton[8 * 2 + 1] * size.height
+
+                            // Draw Thumb HUD label (Leader line + pill text)
+                            val thumbLabelX = thumbTipX - 70f
+                            val thumbLabelY = thumbTipY - 70f
+
+                            drawContext.canvas.nativeCanvas.drawLine(
+                                thumbTipX, thumbTipY,
+                                thumbLabelX, thumbLabelY,
+                                leaderLinePaint
+                            )
+                            val thumbText = "THUMB"
+                            val rect = android.graphics.Rect()
+                            textPaint.getTextBounds(thumbText, 0, thumbText.length, rect)
+                            val padW = 22f
+                            val padH = 16f
+                            val bgRect = android.graphics.RectF(
+                                thumbLabelX - rect.width() / 2f - padW,
+                                thumbLabelY - rect.height() / 2f - padH - 4f,
+                                thumbLabelX + rect.width() / 2f + padW,
+                                thumbLabelY + rect.height() / 2f + padH - 4f
+                            )
+                            drawContext.canvas.nativeCanvas.drawRoundRect(bgRect, 12f, 12f, labelBgPaint)
+                            drawContext.canvas.nativeCanvas.drawRoundRect(bgRect, 12f, 12f, labelBorderPaint)
+                            drawContext.canvas.nativeCanvas.drawText(
+                                thumbText,
+                                thumbLabelX,
+                                thumbLabelY + rect.height() / 2f - 4f,
+                                textPaint
+                            )
+
+                            // Draw Pointer/Index HUD label (Leader line + pill text)
+                            val pointerLabelX = pointerTipX + 70f
+                            val pointerLabelY = pointerTipY - 70f
+
+                            drawContext.canvas.nativeCanvas.drawLine(
+                                pointerTipX, pointerTipY,
+                                pointerLabelX, pointerLabelY,
+                                leaderLinePaint
+                            )
+                            val pointerText = "POINTER"
+                            textPaint.getTextBounds(pointerText, 0, pointerText.length, rect)
+                            val bgRectPointer = android.graphics.RectF(
+                                pointerLabelX - rect.width() / 2f - padW,
+                                pointerLabelY - rect.height() / 2f - padH - 4f,
+                                pointerLabelX + rect.width() / 2f + padW,
+                                pointerLabelY + rect.height() / 2f + padH - 4f
+                            )
+                            drawContext.canvas.nativeCanvas.drawRoundRect(bgRectPointer, 12f, 12f, labelBgPaint)
+                            drawContext.canvas.nativeCanvas.drawRoundRect(bgRectPointer, 12f, 12f, labelBorderPaint)
+                            drawContext.canvas.nativeCanvas.drawText(
+                                pointerText,
+                                pointerLabelX,
+                                pointerLabelY + rect.height() / 2f - 4f,
+                                textPaint
+                            )
                         }
-                    }
-
-                    // Draw hand tracing centroid crosshairs
-                    centroid?.let { (cx, cy) ->
-                        val px = cx * size.width
-                        val py = cy * size.height
-
-                        // Target circle
-                        drawCircle(
-                            color = Color(0xFFC2E7FF),
-                            radius = 16.dp.toPx(),
-                            center = androidx.compose.ui.geometry.Offset(px, py),
-                            style = Stroke(width = 1.5.dp.toPx())
-                        )
-                        // Tiny dot
-                        drawCircle(
-                            color = Color(0xFFC2E7FF),
-                            radius = 3.dp.toPx(),
-                            center = androidx.compose.ui.geometry.Offset(px, py)
-                        )
-
-                        // Vertical tracking scope line
-                        drawLine(
-                            color = Color(0xFFC2E7FF).copy(alpha = 0.3f),
-                            start = androidx.compose.ui.geometry.Offset(px, 0f),
-                            end = androidx.compose.ui.geometry.Offset(px, size.height),
-                            strokeWidth = 1.dp.toPx()
-                        )
-                        // Horizontal tracking scope line
-                        drawLine(
-                            color = Color(0xFFC2E7FF).copy(alpha = 0.3f),
-                            start = androidx.compose.ui.geometry.Offset(0f, py),
-                            end = androidx.compose.ui.geometry.Offset(size.width, py),
-                            strokeWidth = 1.dp.toPx()
-                        )
                     }
                 }
 

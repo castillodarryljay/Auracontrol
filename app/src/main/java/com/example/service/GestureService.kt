@@ -121,6 +121,13 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
     private var gestureMappings = mapOf<String, GestureMapping>()
     private var isFlashlightOn = false
     private var isTrackingPaused = false
+    private var gestureDetectorInstance: GestureDetector? = null
+    
+    private var wasPinching = false
+    private var lastPinchX = 0f
+    private var lastPinchY = 0f
+    private var lastScrollTime = 0L
+
 
     companion object {
         const val NOTIFICATION_ID = 1010
@@ -133,6 +140,38 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
         @Volatile
         var previewUseCase: Preview? = null
 
+        private val activePreviews = mutableListOf<PreviewView>()
+
+        @Synchronized
+        fun registerPreview(previewView: PreviewView) {
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+            handler.post {
+                if (!activePreviews.contains(previewView)) {
+                    activePreviews.add(previewView)
+                }
+                updateSurfaceProvider()
+            }
+        }
+
+        @Synchronized
+        fun unregisterPreview(previewView: PreviewView) {
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+            handler.post {
+                activePreviews.remove(previewView)
+                updateSurfaceProvider()
+            }
+        }
+
+        @Synchronized
+        fun updateSurfaceProvider() {
+            val topPreview = activePreviews.lastOrNull()
+            if (topPreview != null) {
+                previewUseCase?.setSurfaceProvider(topPreview.surfaceProvider)
+            } else {
+                previewUseCase?.setSurfaceProvider(null)
+            }
+        }
+
         val lastGesture = MutableStateFlow<String>("None")
         val lastAction = MutableStateFlow<String>("None")
         val motionDensity = MutableStateFlow(0f)
@@ -140,6 +179,8 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
         val motionGrid = MutableStateFlow(FloatArray(24 * 18))
         val handDetected = MutableStateFlow(false)
         val handSkeleton = MutableStateFlow<FloatArray?>(null)
+        val isPinching = MutableStateFlow(false)
+        val pinchCoordinates = MutableStateFlow<Pair<Float, Float>?>(null)
     }
 
     override fun onCreate() {
@@ -187,7 +228,10 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
         serviceScope.cancel()
         cameraExecutor?.shutdown()
+        gestureDetectorInstance?.close()
+        gestureDetectorInstance = null
         removeFloatingOverlay()
+
         
         // Turn off flashlight if left on
         if (isFlashlightOn) {
@@ -259,12 +303,17 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
 
         val imageAnalysis = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setTargetResolution(android.util.Size(640, 480))
             .build()
 
         val preview = Preview.Builder().build()
         previewUseCase = preview
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        handler.post {
+            updateSurfaceProvider()
+        }
 
-        val gestureDetector = GestureDetector(object : GestureDetector.GestureListener {
+        val gestureDetector = GestureDetector(this, object : GestureDetector.GestureListener {
             override fun onMotionFrame(
                 gridWidth: Int,
                 gridHeight: Int,
@@ -300,7 +349,45 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
                     executeAction(actionId)
                 }
             }
+
+            override fun onPinchStateChanged(isPinch: Boolean, pinchX: Float, pinchY: Float) {
+                if (isTrackingPaused) return
+                
+                GestureService.isPinching.value = isPinch
+                GestureService.pinchCoordinates.value = if (isPinch) Pair(pinchX, pinchY) else null
+
+                if (isPinch) {
+                    val accService = GestureAccessibilityService.instance
+                    if (accService != null) {
+                        if (!wasPinching) {
+                            lastPinchX = pinchX
+                            lastPinchY = pinchY
+                            wasPinching = true
+                            lastScrollTime = System.currentTimeMillis()
+                        } else {
+                            val now = System.currentTimeMillis()
+                            if (now - lastScrollTime > 160L) {
+                                val dx = pinchX - lastPinchX
+                                val dy = pinchY - lastPinchY
+
+                                if (kotlin.math.abs(dx) > 0.015f || kotlin.math.abs(dy) > 0.015f) {
+                                    val success = accService.dispatchDragGesture(dx, dy)
+                                    if (success) {
+                                        lastPinchX = pinchX
+                                        lastPinchY = pinchY
+                                        lastScrollTime = now
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    wasPinching = false
+                }
+            }
         })
+        gestureDetectorInstance = gestureDetector
+
 
         imageAnalysis.setAnalyzer(cameraExecutor!!, gestureDetector)
 
@@ -410,6 +497,7 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
                         motionGridFlow = GestureService.motionGrid,
                         handDetectedFlow = GestureService.handDetected,
                         handSkeletonFlow = GestureService.handSkeleton,
+                        isPinchingFlow = GestureService.isPinching,
                         isPaused = isTrackingPaused,
                         onTogglePause = {
                             isTrackingPaused = !isTrackingPaused
@@ -468,6 +556,7 @@ fun FloatingOverlayContent(
     motionGridFlow: StateFlow<FloatArray>,
     handDetectedFlow: StateFlow<Boolean>,
     handSkeletonFlow: StateFlow<FloatArray?>,
+    isPinchingFlow: StateFlow<Boolean>,
     isPaused: Boolean,
     onTogglePause: () -> Unit,
     onOpenApp: () -> Unit,
@@ -480,10 +569,13 @@ fun FloatingOverlayContent(
     val motionGrid by motionGridFlow.collectAsState()
     val handDetected by handDetectedFlow.collectAsState()
     val handSkeleton by handSkeletonFlow.collectAsState()
+    val isPinching by isPinchingFlow.collectAsState()
 
     val surfaceColor = Color(0xFF1E1E24).copy(alpha = 0.92f)
     val accentColor = if (isPaused) {
         Color(0xFFFFB4AB)
+    } else if (isPinching) {
+        Color(0xFFFF9100) // Glowing Gold/Orange when pinching/scrolling
     } else if (handDetected) {
         Color(0xFF00E676) // Glowing green when hand detected
     } else {
@@ -589,42 +681,32 @@ fun FloatingOverlayContent(
                             .clip(RoundedCornerShape(8.dp))
                             .background(Color.Black)
                     ) {
+                        var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
+                        
+                        DisposableEffect(previewViewRef) {
+                            val view = previewViewRef
+                            if (view != null) {
+                                GestureService.registerPreview(view)
+                            }
+                            onDispose {
+                                if (view != null) {
+                                    GestureService.unregisterPreview(view)
+                                }
+                            }
+                        }
+
                         AndroidView(
                             factory = { ctx ->
                                 PreviewView(ctx).apply {
                                     scaleType = PreviewView.ScaleType.FILL_CENTER
                                     implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                                    previewViewRef = this
                                 }
                             },
-                            update = { previewView ->
-                                try {
-                                    GestureService.previewUseCase?.setSurfaceProvider(previewView.surfaceProvider)
-                                } catch (e: Exception) {
-                                    Log.e("GestureService", "Failed to set surface provider", e)
-                                }
-                            },
+                            update = { },
                             modifier = Modifier.fillMaxSize()
                         )
                         Canvas(modifier = Modifier.fillMaxSize()) {
-                            val cellW = size.width / 24f
-                            val cellH = size.height / 18f
-
-                            for (gy in 0 until 18) {
-                                for (gx in 0 until 24) {
-                                    val index = gy * 24 + gx
-                                    if (index < motionGrid.size) {
-                                        val intensity = motionGrid[index]
-                                        if (intensity > 0f) {
-                                            drawRect(
-                                                color = Color(0xFF00FF87).copy(alpha = (intensity * 1.5f).coerceIn(0f, 1f)),
-                                                topLeft = androidx.compose.ui.geometry.Offset(gx * cellW, gy * cellH),
-                                                size = androidx.compose.ui.geometry.Size(cellW, cellH)
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-
                             // Draw hand skeleton in floating HUD
                             handSkeleton?.let { skeleton ->
                                 if (skeleton.size >= 42) {
@@ -661,6 +743,26 @@ fun FloatingOverlayContent(
                                         )
                                     }
 
+                                    if (isPinching) {
+                                        val x4 = skeleton[4 * 2] * size.width
+                                        val y4 = skeleton[4 * 2 + 1] * size.height
+                                        val x8 = skeleton[8 * 2] * size.width
+                                        val y8 = skeleton[8 * 2 + 1] * size.height
+                                        // Draw a glowing orange line between index and thumb to show pinch connection
+                                        drawLine(
+                                            color = Color(0xFFFF9100),
+                                            start = androidx.compose.ui.geometry.Offset(x4, y4),
+                                            end = androidx.compose.ui.geometry.Offset(x8, y8),
+                                            strokeWidth = 3.dp.toPx()
+                                        )
+                                        // Draw a pulsing circle at the midpoint
+                                        drawCircle(
+                                            color = Color(0xFFFF9100),
+                                            radius = 4.dp.toPx(),
+                                            center = androidx.compose.ui.geometry.Offset((x4 + x8) / 2f, (y4 + y8) / 2f)
+                                        )
+                                    }
+
                                     for (j in 0 until 21) {
                                         val jx = skeleton[j * 2] * size.width
                                         val jy = skeleton[j * 2 + 1] * size.height
@@ -680,30 +782,6 @@ fun FloatingOverlayContent(
                                         }
                                     }
                                 }
-                            }
-
-                            // Draw tracking centroid crosshair
-                            centroid?.let { (cx, cy) ->
-                                val px = cx * size.width
-                                val py = cy * size.height
-                                drawCircle(
-                                    color = accentColor,
-                                    radius = 5.dp.toPx(),
-                                    center = androidx.compose.ui.geometry.Offset(px, py),
-                                    style = Stroke(width = 1.5.dp.toPx())
-                                )
-                                drawLine(
-                                    color = accentColor.copy(alpha = 0.6f),
-                                    start = androidx.compose.ui.geometry.Offset(px - 10.dp.toPx(), py),
-                                    end = androidx.compose.ui.geometry.Offset(px + 10.dp.toPx(), py),
-                                    strokeWidth = 1f
-                                )
-                                drawLine(
-                                    color = accentColor.copy(alpha = 0.6f),
-                                    start = androidx.compose.ui.geometry.Offset(px, py - 10.dp.toPx()),
-                                    end = androidx.compose.ui.geometry.Offset(px, py + 10.dp.toPx()),
-                                    strokeWidth = 1f
-                                )
                             }
                         }
                     }
