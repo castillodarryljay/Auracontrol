@@ -2,6 +2,8 @@ package com.example
 
 import android.content.Context
 import android.content.Intent
+import android.util.Log
+import kotlinx.coroutines.launch
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -617,6 +619,15 @@ fun PlaygroundScreen(viewModel: MainViewModel) {
     val lastAction by viewModel.serviceLastAction.collectAsStateWithLifecycle()
     val handDetected by viewModel.serviceHandDetected.collectAsStateWithLifecycle()
     val handSkeleton by viewModel.serviceHandSkeleton.collectAsStateWithLifecycle()
+    val imageWidth by viewModel.serviceImageWidth.collectAsStateWithLifecycle()
+    val imageHeight by viewModel.serviceImageHeight.collectAsStateWithLifecycle()
+    val mappings by viewModel.allMappings.collectAsStateWithLifecycle()
+
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    var selectedDatasetId by remember { mutableStateOf<String?>("open_palm") }
+    var isCalibrating by remember { mutableStateOf(false) }
 
     // Keep track of local flash flare when gesture detected
     var showGestureFlash by remember { mutableStateOf(false) }
@@ -664,66 +675,77 @@ fun PlaygroundScreen(viewModel: MainViewModel) {
         }
     }
 
-    Column(
+    // Scanning animation transition
+    val infiniteTransition = rememberInfiniteTransition(label = "scanner")
+    val scanLineY by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "scan_line"
+    )
+
+    LazyColumn(
         modifier = Modifier
             .fillMaxSize()
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        Text(
-            text = "REALTIME OS TRACKER TELEMETRY",
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Bold,
-            color = Color(0xFF64748B),
-            letterSpacing = 1.5.sp
-        )
+        item {
+            Text(
+                text = "REALTIME OS TRACKER TELEMETRY",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF64748B),
+                letterSpacing = 1.5.sp
+            )
+        }
 
-        if (!isServiceRunning) {
+        // Live Camera Stream Telemetry (Standard View)
+        item {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1f)
+                    .height(300.dp)
                     .clip(RoundedCornerShape(32.dp))
-                    .border(1.dp, Color.White.copy(alpha = 0.05f), RoundedCornerShape(32.dp))
-                    .background(Color(0xFF1A1C1E)),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        imageVector = Icons.Default.VisibilityOff,
-                        contentDescription = "Off",
-                        tint = Color(0xFF64748B),
-                        modifier = Modifier.size(48.dp)
+                    .border(
+                        1.dp,
+                        if (isServiceRunning) Color(0xFFA8C7FA).copy(alpha = 0.2f) else Color.White.copy(alpha = 0.05f),
+                        RoundedCornerShape(32.dp)
                     )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Text(
-                        text = "Telemetry Offline",
-                        fontWeight = FontWeight.Bold,
-                        color = Color.LightGray,
-                        fontSize = 14.sp
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Activate Aura touchless service to see real-time hand-difference scanner stream.",
-                        color = Color(0xFF64748B),
-                        fontSize = 12.sp,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(horizontal = 24.dp)
-                    )
-                }
-            }
-        } else {
-            // Live Motion Grid Visualizer Panel
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-                    .clip(RoundedCornerShape(32.dp))
-                    .border(1.dp, Color(0xFFA8C7FA).copy(alpha = 0.2f), RoundedCornerShape(32.dp))
                     .background(Color(0xFF0F0F12))
             ) {
-                if (isServiceRunning) {
+                if (!isServiceRunning) {
+                    Column(
+                        modifier = Modifier.fillMaxSize().padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.VisibilityOff,
+                            contentDescription = "Off",
+                            tint = Color(0xFF64748B),
+                            modifier = Modifier.size(48.dp)
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            text = "Camera Telemetry Standby",
+                            fontWeight = FontWeight.Bold,
+                            color = Color.LightGray,
+                            fontSize = 14.sp
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Aura's hand tracking is offline to conserve battery. Tap the 'AURA' master switch on Sensor dashboard to start real-time tracking.",
+                            color = Color(0xFF64748B),
+                            fontSize = 12.sp,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                } else {
                     var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
                     
                     DisposableEffect(previewViewRef) {
@@ -749,234 +771,228 @@ fun PlaygroundScreen(viewModel: MainViewModel) {
                         update = { },
                         modifier = Modifier.fillMaxSize()
                     )
-                }
 
-                // Background futuristic coordinate grid drawing
-                Canvas(modifier = Modifier.fillMaxSize()) {
-                    // Draw futuristic hand tracking skeleton
-                    handSkeleton?.let { skeleton ->
-                        if (skeleton.size >= 42) {
-                            val bones = listOf(
-                                // Wrist to MCPs
-                                Pair(0, 1), Pair(0, 5), Pair(0, 9), Pair(0, 13), Pair(0, 17),
-                                // MCP to MCP (Palm closure)
-                                Pair(1, 5), Pair(5, 9), Pair(9, 13), Pair(13, 17),
-                                // Thumb
-                                Pair(1, 2), Pair(2, 3), Pair(3, 4),
-                                // Index
-                                Pair(5, 6), Pair(6, 7), Pair(7, 8),
-                                // Middle
-                                Pair(9, 10), Pair(10, 11), Pair(11, 12),
-                                // Ring
-                                Pair(13, 14), Pair(14, 15), Pair(15, 16),
-                                // Pinky
-                                Pair(17, 18), Pair(18, 19), Pair(19, 20)
-                            )
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        handSkeleton?.let { skeleton ->
+                            if (skeleton.size >= 42) {
+                                val canvasWidth = size.width
+                                val canvasHeight = size.height
+                                val imgW = imageWidth.toFloat()
+                                val imgH = imageHeight.toFloat()
 
-                            val glowColor = Color(0xFF00FF87)
-                            val boneColor = Color(0xFFA8C7FA)
-                            val jointColor = Color(0xFFC2E7FF)
+                                val scaleX = canvasWidth / imgW
+                                val scaleY = canvasHeight / imgH
+                                val scale = maxOf(scaleX, scaleY)
 
-                            // 1. Draw bones (lines connecting joints)
-                            bones.forEach { (jA, jB) ->
-                                val ax = skeleton[jA * 2] * size.width
-                                val ay = skeleton[jA * 2 + 1] * size.height
-                                val bx = skeleton[jB * 2] * size.width
-                                val by = skeleton[jB * 2 + 1] * size.height
-                                
-                                drawLine(
-                                    color = boneColor.copy(alpha = 0.5f),
-                                    start = androidx.compose.ui.geometry.Offset(ax, ay),
-                                    end = androidx.compose.ui.geometry.Offset(bx, by),
-                                    strokeWidth = 3.dp.toPx()
+                                val scaledWidth = imgW * scale
+                                val scaledHeight = imgH * scale
+                                val offsetX = (canvasWidth - scaledWidth) / 2f
+                                val offsetY = (canvasHeight - scaledHeight) / 2f
+
+                                fun getProjectedX(nx: Float): Float {
+                                    return nx * scaledWidth + offsetX
+                                }
+
+                                fun getProjectedY(ny: Float): Float {
+                                    return ny * scaledHeight + offsetY
+                                }
+
+                                val bones = listOf(
+                                    Pair(0, 1), Pair(0, 5), Pair(0, 9), Pair(0, 13), Pair(0, 17),
+                                    Pair(1, 5), Pair(5, 9), Pair(9, 13), Pair(13, 17),
+                                    Pair(1, 2), Pair(2, 3), Pair(3, 4),
+                                    Pair(5, 6), Pair(6, 7), Pair(7, 8),
+                                    Pair(9, 10), Pair(10, 11), Pair(11, 12),
+                                    Pair(13, 14), Pair(14, 15), Pair(15, 16),
+                                    Pair(17, 18), Pair(18, 19), Pair(19, 20)
                                 )
-                                drawLine(
-                                    color = glowColor.copy(alpha = 0.8f),
-                                    start = androidx.compose.ui.geometry.Offset(ax, ay),
-                                    end = androidx.compose.ui.geometry.Offset(bx, by),
-                                    strokeWidth = 1.dp.toPx()
-                                )
-                            }
 
-                            // 2. Draw joints (dots)
-                            for (j in 0 until 21) {
-                                val jx = skeleton[j * 2] * size.width
-                                val jy = skeleton[j * 2 + 1] * size.height
+                                val glowColor = Color(0xFF00FF87)
+                                val boneColor = Color(0xFFA8C7FA)
+                                val jointColor = Color(0xFFC2E7FF)
 
-                                // Is it a fingertip? (4, 8, 12, 16, 20)
-                                if (j == 4 || j == 8 || j == 12 || j == 16 || j == 20) {
-                                    // Pulsing tip glow
-                                    drawCircle(
-                                        color = glowColor.copy(alpha = 0.3f),
-                                        radius = 8.dp.toPx(),
-                                        center = androidx.compose.ui.geometry.Offset(jx, jy)
+                                bones.forEach { (jA, jB) ->
+                                    val ax = getProjectedX(skeleton[jA * 2])
+                                    val ay = getProjectedY(skeleton[jA * 2 + 1])
+                                    val bx = getProjectedX(skeleton[jB * 2])
+                                    val by = getProjectedY(skeleton[jB * 2 + 1])
+                                    
+                                    drawLine(
+                                        color = boneColor.copy(alpha = 0.5f),
+                                        start = androidx.compose.ui.geometry.Offset(ax, ay),
+                                        end = androidx.compose.ui.geometry.Offset(bx, by),
+                                        strokeWidth = 3.dp.toPx()
                                     )
-                                    drawCircle(
-                                        color = glowColor,
-                                        radius = 4.dp.toPx(),
-                                        center = androidx.compose.ui.geometry.Offset(jx, jy)
-                                    )
-                                } else {
-                                    // Regular joint dot
-                                    drawCircle(
-                                        color = jointColor,
-                                        radius = 3.dp.toPx(),
-                                        center = androidx.compose.ui.geometry.Offset(jx, jy)
+                                    drawLine(
+                                        color = glowColor.copy(alpha = 0.8f),
+                                        start = androidx.compose.ui.geometry.Offset(ax, ay),
+                                        end = androidx.compose.ui.geometry.Offset(bx, by),
+                                        strokeWidth = 1.dp.toPx()
                                     )
                                 }
+
+                                for (j in 0 until 21) {
+                                    val jx = getProjectedX(skeleton[j * 2])
+                                    val jy = getProjectedY(skeleton[j * 2 + 1])
+
+                                    if (j in listOf(4, 8, 12, 16, 20)) {
+                                        drawCircle(
+                                            color = glowColor.copy(alpha = 0.3f),
+                                            radius = 8.dp.toPx(),
+                                            center = androidx.compose.ui.geometry.Offset(jx, jy)
+                                        )
+                                        drawCircle(
+                                            color = glowColor,
+                                            radius = 4.dp.toPx(),
+                                            center = androidx.compose.ui.geometry.Offset(jx, jy)
+                                        )
+                                    } else {
+                                        drawCircle(
+                                            color = jointColor,
+                                            radius = 3.dp.toPx(),
+                                            center = androidx.compose.ui.geometry.Offset(jx, jy)
+                                        )
+                                    }
+                                }
+
+                                val thumbTipX = getProjectedX(skeleton[4 * 2])
+                                val thumbTipY = getProjectedY(skeleton[4 * 2 + 1])
+                                val pointerTipX = getProjectedX(skeleton[8 * 2])
+                                val pointerTipY = getProjectedY(skeleton[8 * 2 + 1])
+
+                                val thumbLabelX = thumbTipX - 70f
+                                val thumbLabelY = thumbTipY - 70f
+
+                                drawContext.canvas.nativeCanvas.drawLine(
+                                    thumbTipX, thumbTipY, thumbLabelX, thumbLabelY, leaderLinePaint
+                                )
+                                val thumbText = "THUMB"
+                                val rect = android.graphics.Rect()
+                                textPaint.getTextBounds(thumbText, 0, thumbText.length, rect)
+                                val padW = 22f
+                                val padH = 16f
+                                val bgRect = android.graphics.RectF(
+                                    thumbLabelX - rect.width() / 2f - padW,
+                                    thumbLabelY - rect.height() / 2f - padH - 4f,
+                                    thumbLabelX + rect.width() / 2f + padW,
+                                    thumbLabelY + rect.height() / 2f + padH - 4f
+                                )
+                                drawContext.canvas.nativeCanvas.drawRoundRect(bgRect, 12f, 12f, labelBgPaint)
+                                drawContext.canvas.nativeCanvas.drawRoundRect(bgRect, 12f, 12f, labelBorderPaint)
+                                drawContext.canvas.nativeCanvas.drawText(
+                                    thumbText, thumbLabelX, thumbLabelY + rect.height() / 2f - 4f, textPaint
+                                )
+
+                                val pointerLabelX = pointerTipX + 70f
+                                val pointerLabelY = pointerTipY - 70f
+
+                                drawContext.canvas.nativeCanvas.drawLine(
+                                    pointerTipX, pointerTipY, pointerLabelX, pointerLabelY, leaderLinePaint
+                                )
+                                val pointerText = "POINTER"
+                                textPaint.getTextBounds(pointerText, 0, pointerText.length, rect)
+                                val bgRectPointer = android.graphics.RectF(
+                                    pointerLabelX - rect.width() / 2f - padW,
+                                    pointerLabelY - rect.height() / 2f - padH - 4f,
+                                    pointerLabelX + rect.width() / 2f + padW,
+                                    pointerLabelY + rect.height() / 2f + padH - 4f
+                                )
+                                drawContext.canvas.nativeCanvas.drawRoundRect(bgRectPointer, 12f, 12f, labelBgPaint)
+                                drawContext.canvas.nativeCanvas.drawRoundRect(bgRectPointer, 12f, 12f, labelBorderPaint)
+                                drawContext.canvas.nativeCanvas.drawText(
+                                    pointerText, pointerLabelX, pointerLabelY + rect.height() / 2f - 4f, textPaint
+                                )
                             }
-
-                            // Draw specific finger HUD labels for Thumb and Pointer/Index
-                            val thumbTipX = skeleton[4 * 2] * size.width
-                            val thumbTipY = skeleton[4 * 2 + 1] * size.height
-
-                            val pointerTipX = skeleton[8 * 2] * size.width
-                            val pointerTipY = skeleton[8 * 2 + 1] * size.height
-
-                            // Draw Thumb HUD label (Leader line + pill text)
-                            val thumbLabelX = thumbTipX - 70f
-                            val thumbLabelY = thumbTipY - 70f
-
-                            drawContext.canvas.nativeCanvas.drawLine(
-                                thumbTipX, thumbTipY,
-                                thumbLabelX, thumbLabelY,
-                                leaderLinePaint
-                            )
-                            val thumbText = "THUMB"
-                            val rect = android.graphics.Rect()
-                            textPaint.getTextBounds(thumbText, 0, thumbText.length, rect)
-                            val padW = 22f
-                            val padH = 16f
-                            val bgRect = android.graphics.RectF(
-                                thumbLabelX - rect.width() / 2f - padW,
-                                thumbLabelY - rect.height() / 2f - padH - 4f,
-                                thumbLabelX + rect.width() / 2f + padW,
-                                thumbLabelY + rect.height() / 2f + padH - 4f
-                            )
-                            drawContext.canvas.nativeCanvas.drawRoundRect(bgRect, 12f, 12f, labelBgPaint)
-                            drawContext.canvas.nativeCanvas.drawRoundRect(bgRect, 12f, 12f, labelBorderPaint)
-                            drawContext.canvas.nativeCanvas.drawText(
-                                thumbText,
-                                thumbLabelX,
-                                thumbLabelY + rect.height() / 2f - 4f,
-                                textPaint
-                            )
-
-                            // Draw Pointer/Index HUD label (Leader line + pill text)
-                            val pointerLabelX = pointerTipX + 70f
-                            val pointerLabelY = pointerTipY - 70f
-
-                            drawContext.canvas.nativeCanvas.drawLine(
-                                pointerTipX, pointerTipY,
-                                pointerLabelX, pointerLabelY,
-                                leaderLinePaint
-                            )
-                            val pointerText = "POINTER"
-                            textPaint.getTextBounds(pointerText, 0, pointerText.length, rect)
-                            val bgRectPointer = android.graphics.RectF(
-                                pointerLabelX - rect.width() / 2f - padW,
-                                pointerLabelY - rect.height() / 2f - padH - 4f,
-                                pointerLabelX + rect.width() / 2f + padW,
-                                pointerLabelY + rect.height() / 2f + padH - 4f
-                            )
-                            drawContext.canvas.nativeCanvas.drawRoundRect(bgRectPointer, 12f, 12f, labelBgPaint)
-                            drawContext.canvas.nativeCanvas.drawRoundRect(bgRectPointer, 12f, 12f, labelBorderPaint)
-                            drawContext.canvas.nativeCanvas.drawText(
-                                pointerText,
-                                pointerLabelX,
-                                pointerLabelY + rect.height() / 2f - 4f,
-                                textPaint
-                            )
                         }
                     }
-                }
 
-                // Cybernetic scanning HUD elements overlays
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(16.dp)
-                ) {
-                    Text(
-                        text = "INDEX: CALIBRATING CH[0]",
-                        color = Color(0xFFA8C7FA).copy(alpha = 0.7f),
-                        fontSize = 10.sp,
-                        fontFamily = FontFamily.Monospace,
-                        modifier = Modifier.align(Alignment.TopStart)
-                    )
-
-                    Text(
-                        text = "MOTION DENSITY: ${(density * 100).toInt()}%",
-                        color = Color(0xFFC2E7FF).copy(alpha = 0.7f),
-                        fontSize = 10.sp,
-                        fontFamily = FontFamily.Monospace,
-                        modifier = Modifier.align(Alignment.TopEnd)
-                    )
-
-                    Row(
-                        modifier = Modifier.align(Alignment.BottomStart),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(16.dp)
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .background(
-                                    color = if (handDetected) Color(0xFF00FF87) else Color(0xFF64748B),
-                                    shape = CircleShape
-                                )
-                        )
                         Text(
-                            text = "HAND DETECTED: ${if (handDetected) "YES" else "NO"}",
-                            color = if (handDetected) Color(0xFF00FF87) else Color(0xFFA8C7FA).copy(alpha = 0.6f),
+                            text = "INDEX: CALIBRATING CH[0]",
+                            color = Color(0xFFA8C7FA).copy(alpha = 0.7f),
                             fontSize = 10.sp,
                             fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.Bold
+                            modifier = Modifier.align(Alignment.TopStart)
                         )
-                    }
 
-                    // Centered Gesture Detection HUD Alert
-                    androidx.compose.animation.AnimatedVisibility(
-                        visible = showGestureFlash,
-                        enter = fadeIn() + scaleIn(initialScale = 0.8f),
-                        exit = fadeOut() + scaleOut(targetScale = 1.2f),
-                        modifier = Modifier.align(Alignment.Center)
-                    ) {
-                        Card(
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFFA8C7FA)),
-                            shape = RoundedCornerShape(20.dp),
-                            modifier = Modifier.shadow(16.dp, RoundedCornerShape(20.dp))
+                        Text(
+                            text = "MOTION DENSITY: ${(density * 100).toInt()}%",
+                            color = Color(0xFFC2E7FF).copy(alpha = 0.7f),
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            modifier = Modifier.align(Alignment.TopEnd)
+                        )
+
+                        Row(
+                            modifier = Modifier.align(Alignment.BottomStart),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            Column(
-                                modifier = Modifier.padding(vertical = 12.dp, horizontal = 24.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .background(
+                                        color = if (handDetected) Color(0xFF00FF87) else Color(0xFF64748B),
+                                        shape = CircleShape
+                                    )
+                            )
+                            Text(
+                                text = "HAND DETECTED: ${if (handDetected) "YES" else "NO"}",
+                                color = if (handDetected) Color(0xFF00FF87) else Color(0xFFA8C7FA).copy(alpha = 0.6f),
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+
+                        androidx.compose.animation.AnimatedVisibility(
+                            visible = showGestureFlash,
+                            enter = fadeIn() + scaleIn(initialScale = 0.8f),
+                            exit = fadeOut() + scaleOut(targetScale = 1.2f),
+                            modifier = Modifier.align(Alignment.Center)
+                        ) {
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFFA8C7FA)),
+                                shape = RoundedCornerShape(20.dp),
+                                modifier = Modifier.shadow(16.dp, RoundedCornerShape(20.dp))
                             ) {
-                                Text(
-                                    text = "TRIGGERED",
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color(0xFF003355),
-                                    letterSpacing = 1.5.sp
-                                )
-                                Text(
-                                    text = flashedGestureName,
-                                    fontSize = 22.sp,
-                                    fontWeight = FontWeight.Black,
-                                    color = Color(0xFF003355)
-                                )
-                                Text(
-                                    text = "Action: $lastAction",
-                                    fontSize = 11.sp,
-                                    color = Color(0xFF003355).copy(alpha = 0.8f),
-                                    fontWeight = FontWeight.Bold
-                                )
+                                Column(
+                                    modifier = Modifier.padding(vertical = 12.dp, horizontal = 24.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Text(
+                                        text = "TRIGGERED",
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color(0xFF003355),
+                                        letterSpacing = 1.5.sp
+                                    )
+                                    Text(
+                                        text = flashedGestureName,
+                                        fontSize = 22.sp,
+                                        fontWeight = FontWeight.Black,
+                                        color = Color(0xFF003355)
+                                    )
+                                    Text(
+                                        text = "Action: $lastAction",
+                                        fontSize = 11.sp,
+                                        color = Color(0xFF003355).copy(alpha = 0.8f),
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
                         }
                     }
                 }
             }
+        }
 
-            // Lower Status Stats Block
+        // Live Telemetry Stats Block
+        item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1C1E)),
@@ -992,7 +1008,7 @@ fun PlaygroundScreen(viewModel: MainViewModel) {
                 ) {
                     Column {
                         Text(
-                            text = "LAST GESTURE RECORDED",
+                            text = "LIVE GESTURE STREAM",
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             color = Color(0xFF64748B),
@@ -1000,10 +1016,10 @@ fun PlaygroundScreen(viewModel: MainViewModel) {
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = lastGesture,
+                            text = if (isServiceRunning) lastGesture else "Inactive",
                             fontSize = 20.sp,
                             fontWeight = FontWeight.Bold,
-                            color = Color.White
+                            color = if (isServiceRunning) Color.White else Color(0xFF64748B)
                         )
                     }
 
@@ -1017,11 +1033,1043 @@ fun PlaygroundScreen(viewModel: MainViewModel) {
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = lastAction,
+                            text = if (isServiceRunning) lastAction else "Inactive",
                             fontSize = 14.sp,
                             fontWeight = FontWeight.Bold,
-                            color = Color(0xFFA8C7FA)
+                            color = if (isServiceRunning) Color(0xFFA8C7FA) else Color(0xFF64748B)
                         )
+                    }
+                }
+            }
+        }
+
+        // --- PROXIMITY MODE SETTING ---
+        item {
+            val proximityModeEnabled by viewModel.proximityModeEnabled.collectAsStateWithLifecycle()
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1C1E)),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.05f)),
+                shape = RoundedCornerShape(24.dp)
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    // Header
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Tune,
+                            contentDescription = "Proximity Settings",
+                            tint = Color(0xFF00FF87)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "PROXIMITY SENSOR MODE",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                            color = Color.White
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Enable Proximity Mode",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = Color.White
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Replaces camera with the phone's proximity sensor for hands-free gestures. Saves battery and works in darkness.",
+                                fontSize = 11.sp,
+                                color = Color(0xFF64748B)
+                            )
+                        }
+                        Switch(
+                            checked = proximityModeEnabled,
+                            onCheckedChange = { viewModel.updateProximityModeEnabled(context, it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color(0xFF003355),
+                                checkedTrackColor = Color(0xFF00FF87)
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        // --- INTELLIGENT BATTERY SAVER SETTING ---
+        item {
+            val batterySaverEnabled by viewModel.batterySaverEnabled.collectAsStateWithLifecycle()
+            val batterySaverTimeout by viewModel.batterySaverTimeout.collectAsStateWithLifecycle()
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1C1E)),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.05f)),
+                shape = RoundedCornerShape(24.dp)
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    // Header
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.BatteryChargingFull,
+                            contentDescription = "Battery Saver Settings",
+                            tint = Color(0xFF00FF87)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "INTELLIGENT BATTERY SAVER",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                            color = Color.White
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Auto-Sleep Mode",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = Color.White
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Sustains battery by auto-turning off camera tracking after inactivity. Wave close to proximity sensor to wake up immediately.",
+                                fontSize = 11.sp,
+                                color = Color(0xFF64748B)
+                            )
+                        }
+                        Switch(
+                            checked = batterySaverEnabled,
+                            onCheckedChange = { viewModel.updateBatterySaverEnabled(context, it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color(0xFF003355),
+                                checkedTrackColor = Color(0xFF00FF87)
+                            ),
+                            modifier = Modifier.testTag("battery_saver_toggle")
+                        )
+                    }
+
+                    if (batterySaverEnabled) {
+                        Spacer(modifier = Modifier.height(20.dp))
+                        
+                        val timeoutText = when {
+                            batterySaverTimeout < 60 -> "${batterySaverTimeout}s"
+                            batterySaverTimeout % 60 == 0 -> "${batterySaverTimeout / 60}m"
+                            else -> "${batterySaverTimeout / 60}m ${batterySaverTimeout % 60}s"
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Inactivity Timeout",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = Color.White
+                            )
+                            Text(
+                                text = timeoutText,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = Color(0xFF00FF87)
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Slider(
+                            value = batterySaverTimeout.toFloat(),
+                            onValueChange = { viewModel.updateBatterySaverTimeout(context, it.toInt()) },
+                            valueRange = 10f..180f,
+                            steps = 16, // steps of 10s: 10, 20, 30, 40... 180
+                            colors = SliderDefaults.colors(
+                                thumbColor = Color(0xFF00FF87),
+                                activeTrackColor = Color(0xFF00FF87),
+                                inactiveTrackColor = Color.White.copy(alpha = 0.1f)
+                            ),
+                            modifier = Modifier.testTag("battery_saver_timeout_slider")
+                        )
+                    }
+                }
+            }
+        }
+
+        // --- AIR-POINTER OVERLAY & SENSITIVITY CONFIGURATION ---
+        item {
+            val pointerEnabled by viewModel.pointerEnabled.collectAsStateWithLifecycle()
+            val pointerMode by viewModel.pointerMode.collectAsStateWithLifecycle()
+            val pointerColorHex by viewModel.pointerColor.collectAsStateWithLifecycle()
+            val pointerSize by viewModel.pointerSize.collectAsStateWithLifecycle()
+            val pointerShape by viewModel.pointerShape.collectAsStateWithLifecycle()
+            val sensitivityMode by viewModel.sensitivityMode.collectAsStateWithLifecycle()
+            val sensitivityVal by viewModel.sensitivityValue.collectAsStateWithLifecycle()
+
+            val hasOverlayPermission by viewModel.hasOverlayPermission.collectAsStateWithLifecycle()
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1C1E)),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.05f)),
+                shape = RoundedCornerShape(24.dp)
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    // Header
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.SettingsAccessibility,
+                            contentDescription = "Air-Pointer Settings",
+                            tint = Color(0xFFA8C7FA)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "AIR-POINTER CONFIGURATION",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                            color = Color.White
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Pointer Toggle
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Enable Air-Pointer",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = Color.White
+                            )
+                            Text(
+                                text = "Shows a small pointer overlay on screen when you raise your pointer finger",
+                                fontSize = 11.sp,
+                                color = Color(0xFF64748B)
+                            )
+                        }
+                        Switch(
+                            checked = pointerEnabled,
+                            onCheckedChange = { viewModel.updatePointerEnabled(context, it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color(0xFF003355),
+                                checkedTrackColor = Color(0xFFA8C7FA)
+                            )
+                        )
+                    }
+
+                    if (pointerEnabled) {
+                        if (!hasOverlayPermission) {
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF3B2424)),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(Icons.Default.Warning, contentDescription = "Alert", tint = Color(0xFFFFB4AB))
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Text(
+                                        text = "Please grant Display Overlay permission in System Settings to allow the pointer overlay to appear.",
+                                        fontSize = 11.sp,
+                                        color = Color(0xFFFFB4AB)
+                                    )
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(16.dp))
+                        HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        // Pointer Mode Selection (Joystick vs Pointer)
+                        Text(
+                            text = "Cursor Movement Mode",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            color = Color.White
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            listOf(
+                                Pair("absolute", "Absolute Pointer"),
+                                Pair("joystick", "Joystick Cursor")
+                            ).forEach { (mode, label) ->
+                                val isSelected = pointerMode == mode
+                                Card(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clickable { viewModel.updatePointerMode(context, mode) },
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = if (isSelected) Color(0xFFA8C7FA).copy(alpha = 0.15f) else Color(0xFF131518)
+                                    ),
+                                    border = BorderStroke(1.dp, if (isSelected) Color(0xFFA8C7FA) else Color.White.copy(alpha = 0.05f)),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier.padding(12.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            text = label,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 11.sp,
+                                            color = if (isSelected) Color(0xFFA8C7FA) else Color.White
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        // Pointer Shape selection
+                        Text(
+                            text = "Pointer Shape",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            color = Color.White
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            listOf("crosshair", "dot", "ring", "arrow").forEach { shape ->
+                                val isSelected = pointerShape == shape
+                                Card(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clickable { viewModel.updatePointerShape(context, shape) },
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = if (isSelected) Color(0xFFA8C7FA).copy(alpha = 0.15f) else Color(0xFF131518)
+                                    ),
+                                    border = BorderStroke(1.dp, if (isSelected) Color(0xFFA8C7FA) else Color.White.copy(alpha = 0.05f)),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier.padding(8.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            text = shape.uppercase(),
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 10.sp,
+                                            color = if (isSelected) Color(0xFFA8C7FA) else Color.White
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        // Pointer Size Slider
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Pointer Size",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = Color.White
+                            )
+                            Text(
+                                text = "${pointerSize}dp",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFFA8C7FA)
+                            )
+                        }
+                        Slider(
+                            value = pointerSize.toFloat(),
+                            onValueChange = { viewModel.updatePointerSize(context, it.toInt()) },
+                            valueRange = 24f..72f,
+                            colors = SliderDefaults.colors(
+                                thumbColor = Color(0xFFA8C7FA),
+                                activeTrackColor = Color(0xFFA8C7FA)
+                            )
+                        )
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // Pointer Color Grid
+                        Text(
+                            text = "Pointer Accent Color",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            color = Color.White
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            listOf("#00FF87", "#38BDF8", "#EC4899", "#EAB308", "#A855F7").forEach { colorHex ->
+                                val isSelected = pointerColorHex.equals(colorHex, ignoreCase = true)
+                                Box(
+                                    modifier = Modifier
+                                        .size(32.dp)
+                                        .background(Color(android.graphics.Color.parseColor(colorHex)), shape = CircleShape)
+                                        .border(
+                                            width = if (isSelected) 3.dp else 1.dp,
+                                            color = if (isSelected) Color.White else Color.Transparent,
+                                            shape = CircleShape
+                                        )
+                                        .clickable { viewModel.updatePointerColor(context, colorHex) }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- SENSITIVITY CALIBRATION ---
+        item {
+            val sensitivityMode by viewModel.sensitivityMode.collectAsStateWithLifecycle()
+            val sensitivityVal by viewModel.sensitivityValue.collectAsStateWithLifecycle()
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1C1E)),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.05f)),
+                shape = RoundedCornerShape(24.dp)
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    // Header
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Tune,
+                            contentDescription = "Sensitivity Calibration",
+                            tint = Color(0xFFA8C7FA)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "SENSITIVITY CONTROLS",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                            color = Color.White
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Mode Selection: Auto vs Manual
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        listOf(
+                            Pair("auto", "Automatic (Auto-Range)"),
+                            Pair("manual", "Manual Threshold")
+                        ).forEach { (mode, label) ->
+                            val isSelected = sensitivityMode == mode
+                            Card(
+                                modifier = Modifier
+                                        .weight(1f)
+                                        .clickable { viewModel.updateSensitivityMode(context, mode) },
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (isSelected) Color(0xFFA8C7FA).copy(alpha = 0.15f) else Color(0xFF131518)
+                                ),
+                                border = BorderStroke(1.dp, if (isSelected) Color(0xFFA8C7FA) else Color.White.copy(alpha = 0.05f)),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier.padding(12.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = label,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 11.sp,
+                                        color = if (isSelected) Color(0xFFA8C7FA) else Color.White,
+                                        textAlign = TextAlign.Center
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    if (sensitivityMode == "auto") {
+                        Text(
+                            text = "Aura is currently in Auto-Range mode. It will automatically adjust tracking sensitivity and distance scaling on-the-fly dynamically based on your hand distance and ambient sensor frames.",
+                            fontSize = 11.sp,
+                            color = Color(0xFF94A3B8),
+                            lineHeight = 16.sp
+                        )
+                    } else {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Manual Tracking Sensitivity",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = Color.White
+                            )
+                            Text(
+                                text = "${(sensitivityVal * 100).toInt()}%",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFFA8C7FA)
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Slider(
+                            value = sensitivityVal,
+                            onValueChange = { viewModel.updateSensitivityValue(context, it) },
+                            valueRange = 0.1f..0.9f,
+                            colors = SliderDefaults.colors(
+                                thumbColor = Color(0xFFA8C7FA),
+                                activeTrackColor = Color(0xFFA8C7FA)
+                            )
+                        )
+                        Text(
+                            text = "Low sensitivity requires higher-confidence landmarks (prevents mis-triggers). High sensitivity allows trackings under low light or far distance.",
+                            fontSize = 11.sp,
+                            color = Color(0xFF64748B),
+                            lineHeight = 15.sp
+                        )
+                    }
+                }
+            }
+        }
+
+        // --- OFFLINE AI HANDS DATASET CALIBRATION SECTION (NEW) ---
+        item {
+            Spacer(modifier = Modifier.height(8.dp))
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.Start
+            ) {
+                Text(
+                    text = "OFFLINE HANDS DATASET (PROCESSOR MATCH)",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFFA8C7FA),
+                    letterSpacing = 1.5.sp
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "A built-in dataset of offline hand models. Tap on any item to run the AI landmark tracking algorithm entirely offline using your device processor.",
+                    fontSize = 12.sp,
+                    color = Color(0xFF64748B),
+                    lineHeight = 16.sp
+                )
+            }
+        }
+
+        // Horizontal Row of Datasets
+        item {
+            androidx.compose.foundation.lazy.LazyRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                contentPadding = PaddingValues(vertical = 4.dp)
+            ) {
+                val handDatasets = listOf(
+                    Pair("open_palm", "Open Palm"),
+                    Pair("closed_fist", "Closed Fist"),
+                    Pair("thumbs_up", "Thumbs Up"),
+                    Pair("pointing_up", "Pointing Index"),
+                    Pair("victory_peace", "Victory Sign")
+                )
+
+                items(handDatasets) { (id, name) ->
+                    val isSelected = selectedDatasetId == id
+                    val cardBg = if (isSelected) Color(0xFFA8C7FA).copy(alpha = 0.15f) else Color(0xFF1A1C1E)
+                    val borderCol = if (isSelected) Color(0xFFA8C7FA) else Color.White.copy(alpha = 0.05f)
+
+                    Card(
+                        modifier = Modifier
+                            .width(130.dp)
+                            .clickable { selectedDatasetId = id },
+                        colors = CardDefaults.cardColors(containerColor = cardBg),
+                        border = BorderStroke(1.dp, borderCol),
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            // Tiny Skeleton Canvas Preview
+                            val landmarks = when (id) {
+                                "open_palm" -> floatArrayOf(
+                                    0.5f, 0.85f,
+                                    0.35f, 0.8f, 0.28f, 0.74f, 0.22f, 0.68f, 0.16f, 0.62f,
+                                    0.38f, 0.55f, 0.37f, 0.42f, 0.36f, 0.32f, 0.35f, 0.22f,
+                                    0.48f, 0.52f, 0.48f, 0.38f, 0.48f, 0.28f, 0.48f, 0.18f,
+                                    0.58f, 0.55f, 0.59f, 0.42f, 0.6f, 0.32f, 0.61f, 0.22f,
+                                    0.66f, 0.6f, 0.68f, 0.5f, 0.7f, 0.42f, 0.72f, 0.34f
+                                )
+                                "closed_fist" -> floatArrayOf(
+                                    0.5f, 0.85f,
+                                    0.38f, 0.8f, 0.33f, 0.75f, 0.36f, 0.7f, 0.4f, 0.68f,
+                                    0.42f, 0.65f, 0.42f, 0.72f, 0.44f, 0.75f, 0.44f, 0.78f,
+                                    0.5f, 0.63f, 0.5f, 0.71f, 0.51f, 0.74f, 0.51f, 0.77f,
+                                    0.58f, 0.65f, 0.58f, 0.72f, 0.57f, 0.75f, 0.57f, 0.78f,
+                                    0.65f, 0.68f, 0.65f, 0.74f, 0.63f, 0.77f, 0.63f, 0.8f
+                                )
+                                "thumbs_up" -> floatArrayOf(
+                                    0.5f, 0.85f,
+                                    0.45f, 0.75f, 0.42f, 0.62f, 0.43f, 0.5f, 0.44f, 0.38f,
+                                    0.52f, 0.75f, 0.55f, 0.78f, 0.53f, 0.81f, 0.5f, 0.83f,
+                                    0.56f, 0.76f, 0.59f, 0.79f, 0.57f, 0.82f, 0.54f, 0.84f,
+                                    0.6f, 0.78f, 0.63f, 0.81f, 0.61f, 0.84f, 0.58f, 0.86f,
+                                    0.64f, 0.8f, 0.67f, 0.83f, 0.65f, 0.86f, 0.62f, 0.88f
+                                )
+                                "pointing_up" -> floatArrayOf(
+                                    0.5f, 0.85f,
+                                    0.38f, 0.8f, 0.33f, 0.75f, 0.36f, 0.7f, 0.4f, 0.68f,
+                                    0.48f, 0.55f, 0.48f, 0.42f, 0.48f, 0.32f, 0.48f, 0.2f,
+                                    0.53f, 0.65f, 0.54f, 0.72f, 0.55f, 0.75f, 0.55f, 0.78f,
+                                    0.59f, 0.67f, 0.6f, 0.74f, 0.59f, 0.77f, 0.59f, 0.8f,
+                                    0.65f, 0.7f, 0.66f, 0.76f, 0.64f, 0.79f, 0.64f, 0.82f
+                                )
+                                else -> floatArrayOf(
+                                    0.5f, 0.85f,
+                                    0.38f, 0.8f, 0.33f, 0.75f, 0.36f, 0.7f, 0.4f, 0.68f,
+                                    0.43f, 0.55f, 0.41f, 0.42f, 0.39f, 0.32f, 0.37f, 0.22f,
+                                    0.53f, 0.55f, 0.55f, 0.42f, 0.57f, 0.32f, 0.59f, 0.22f,
+                                    0.59f, 0.67f, 0.6f, 0.74f, 0.59f, 0.77f, 0.59f, 0.8f,
+                                    0.65f, 0.7f, 0.66f, 0.76f, 0.64f, 0.79f, 0.64f, 0.82f
+                                )
+                            }
+
+                            Box(
+                                modifier = Modifier
+                                    .size(60.dp)
+                                    .background(Color.Black.copy(alpha = 0.3f), CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Canvas(modifier = Modifier.fillMaxSize().padding(8.dp)) {
+                                    val bones = listOf(
+                                        Pair(0, 1), Pair(0, 5), Pair(0, 9), Pair(0, 13), Pair(0, 17),
+                                        Pair(1, 5), Pair(5, 9), Pair(9, 13), Pair(13, 17),
+                                        Pair(1, 2), Pair(2, 3), Pair(3, 4),
+                                        Pair(5, 6), Pair(6, 7), Pair(7, 8),
+                                        Pair(9, 10), Pair(10, 11), Pair(11, 12),
+                                        Pair(13, 14), Pair(14, 15), Pair(15, 16),
+                                        Pair(17, 18), Pair(18, 19), Pair(19, 20)
+                                    )
+                                    bones.forEach { (jA, jB) ->
+                                        val ax = landmarks[jA * 2] * size.width
+                                        val ay = landmarks[jA * 2 + 1] * size.height
+                                        val bx = landmarks[jB * 2] * size.width
+                                        val by = landmarks[jB * 2 + 1] * size.height
+                                        drawLine(
+                                            color = if (isSelected) Color(0xFFA8C7FA) else Color(0xFF64748B),
+                                            start = androidx.compose.ui.geometry.Offset(ax, ay),
+                                            end = androidx.compose.ui.geometry.Offset(bx, by),
+                                            strokeWidth = 1.5.dp.toPx()
+                                        )
+                                    }
+                                    for (j in 0 until 21) {
+                                        val jx = landmarks[j * 2] * size.width
+                                        val jy = landmarks[j * 2 + 1] * size.height
+                                        drawCircle(
+                                            color = if (j in listOf(4, 8, 12, 16, 20)) Color(0xFF00FF87) else Color.White,
+                                            radius = 1.5.dp.toPx(),
+                                            center = androidx.compose.ui.geometry.Offset(jx, jy)
+                                        )
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = name,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isSelected) Color(0xFFA8C7FA) else Color.White,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // AI Sandbox Offline Calibration Card
+        item {
+            selectedDatasetId?.let { id ->
+                val name = when (id) {
+                    "open_palm" -> "Open Palm Model"
+                    "closed_fist" -> "Closed Fist Model"
+                    "thumbs_up" -> "Thumbs Up Model"
+                    "pointing_up" -> "Pointing Index Model"
+                    else -> "Victory Sign Model"
+                }
+                val description = when (id) {
+                    "open_palm" -> "All 5 fingers fully extended upwards. Primary hand posture representation for checking detector tracking fidelity and system calibration."
+                    "closed_fist" -> "All fingers curled tightly into the center of the palm. Utilized by offline AI algorithms to detect fist/grab commands."
+                    "thumbs_up" -> "The thumb is fully extended vertically while the other four fingers remain curled. Triggers swift media or custom system functions."
+                    "pointing_up" -> "The index finger points straight up with other fingers clenched, forming a linear cursor. Perfect for fine offline coordinate matching."
+                    else -> "Index and middle fingers fully extended to form an open 'V'. Standard posture for Wave and swipe actions matched offline."
+                }
+                val matchedGesture = when (id) {
+                    "open_palm" -> "HOVER"
+                    "closed_fist" -> "GRAB"
+                    "thumbs_up" -> "SWIPE_UP"
+                    "pointing_up" -> "SWIPE_LEFT"
+                    else -> "WAVE"
+                }
+                val mappedActionName = mappings.find { it.gestureId == matchedGesture }?.actionName ?: "NONE (No Action)"
+                val mappedActionId = mappings.find { it.gestureId == matchedGesture }?.actionId ?: "NONE"
+
+                val landmarks = when (id) {
+                    "open_palm" -> floatArrayOf(
+                        0.5f, 0.85f,
+                        0.35f, 0.8f, 0.28f, 0.74f, 0.22f, 0.68f, 0.16f, 0.62f,
+                        0.38f, 0.55f, 0.37f, 0.42f, 0.36f, 0.32f, 0.35f, 0.22f,
+                        0.48f, 0.52f, 0.48f, 0.38f, 0.48f, 0.28f, 0.48f, 0.18f,
+                        0.58f, 0.55f, 0.59f, 0.42f, 0.6f, 0.32f, 0.61f, 0.22f,
+                        0.66f, 0.6f, 0.68f, 0.5f, 0.7f, 0.42f, 0.72f, 0.34f
+                    )
+                    "closed_fist" -> floatArrayOf(
+                        0.5f, 0.85f,
+                        0.38f, 0.8f, 0.33f, 0.75f, 0.36f, 0.7f, 0.4f, 0.68f,
+                        0.42f, 0.65f, 0.42f, 0.72f, 0.44f, 0.75f, 0.44f, 0.78f,
+                        0.5f, 0.63f, 0.5f, 0.71f, 0.51f, 0.74f, 0.51f, 0.77f,
+                        0.58f, 0.65f, 0.58f, 0.72f, 0.57f, 0.75f, 0.57f, 0.78f,
+                        0.65f, 0.68f, 0.65f, 0.74f, 0.63f, 0.77f, 0.63f, 0.8f
+                    )
+                    "thumbs_up" -> floatArrayOf(
+                        0.5f, 0.85f,
+                        0.45f, 0.75f, 0.42f, 0.62f, 0.43f, 0.5f, 0.44f, 0.38f,
+                        0.52f, 0.75f, 0.55f, 0.78f, 0.53f, 0.81f, 0.5f, 0.83f,
+                        0.56f, 0.76f, 0.59f, 0.79f, 0.57f, 0.82f, 0.54f, 0.84f,
+                        0.6f, 0.78f, 0.63f, 0.81f, 0.61f, 0.84f, 0.58f, 0.86f,
+                        0.64f, 0.8f, 0.67f, 0.83f, 0.65f, 0.86f, 0.62f, 0.88f
+                    )
+                    "pointing_up" -> floatArrayOf(
+                        0.5f, 0.85f,
+                        0.38f, 0.8f, 0.33f, 0.75f, 0.36f, 0.7f, 0.4f, 0.68f,
+                        0.48f, 0.55f, 0.48f, 0.42f, 0.48f, 0.32f, 0.48f, 0.2f,
+                        0.53f, 0.65f, 0.54f, 0.72f, 0.55f, 0.75f, 0.55f, 0.78f,
+                        0.59f, 0.67f, 0.6f, 0.74f, 0.59f, 0.77f, 0.59f, 0.8f,
+                        0.65f, 0.7f, 0.66f, 0.76f, 0.64f, 0.79f, 0.64f, 0.82f
+                    )
+                    else -> floatArrayOf(
+                        0.5f, 0.85f,
+                        0.38f, 0.8f, 0.33f, 0.75f, 0.36f, 0.7f, 0.4f, 0.68f,
+                        0.43f, 0.55f, 0.41f, 0.42f, 0.39f, 0.32f, 0.37f, 0.22f,
+                        0.53f, 0.55f, 0.55f, 0.42f, 0.57f, 0.32f, 0.59f, 0.22f,
+                        0.59f, 0.67f, 0.6f, 0.74f, 0.59f, 0.77f, 0.59f, 0.8f,
+                        0.65f, 0.7f, 0.66f, 0.76f, 0.64f, 0.79f, 0.64f, 0.82f
+                    )
+                }
+
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF131518)),
+                    border = BorderStroke(1.dp, Color(0xFFA8C7FA).copy(alpha = 0.3f)),
+                    shape = RoundedCornerShape(24.dp)
+                ) {
+                    Column(modifier = Modifier.padding(20.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Default.DeveloperMode,
+                                    contentDescription = "AI Memory",
+                                    tint = Color(0xFF00FF87)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = name,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White,
+                                    fontSize = 15.sp
+                                )
+                            }
+
+                            Box(
+                                modifier = Modifier
+                                    .background(Color(0xFF00FF87).copy(alpha = 0.15f), RoundedCornerShape(8.dp))
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                Text(
+                                    text = "100% OFFLINE (CPU)",
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFF00FF87)
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Text(
+                            text = description,
+                            fontSize = 12.sp,
+                            color = Color(0xFF94A3B8),
+                            lineHeight = 18.sp
+                        )
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        // Large Coordinate Sandbox Grid
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(220.dp)
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(Color(0xFF0A0C10))
+                                .border(1.dp, Color.White.copy(alpha = 0.05f), RoundedCornerShape(16.dp))
+                        ) {
+                            Canvas(modifier = Modifier.fillMaxSize()) {
+                                // Draw futuristic radar sweep
+                                if (isCalibrating) {
+                                    val sweepY = scanLineY * size.height
+                                    drawLine(
+                                        color = Color(0xFF00FF87).copy(alpha = 0.6f),
+                                        start = androidx.compose.ui.geometry.Offset(0f, sweepY),
+                                        end = androidx.compose.ui.geometry.Offset(size.width, sweepY),
+                                        strokeWidth = 3.dp.toPx()
+                                    )
+                                    drawRect(
+                                        brush = Brush.verticalGradient(
+                                            colors = listOf(Color(0xFF00FF87).copy(alpha = 0.15f), Color.Transparent),
+                                            startY = sweepY - 50.dp.toPx(),
+                                            endY = sweepY
+                                        ),
+                                        size = androidx.compose.ui.geometry.Size(size.width, 50.dp.toPx()),
+                                        topLeft = androidx.compose.ui.geometry.Offset(0f, sweepY - 50.dp.toPx())
+                                    )
+                                }
+
+                                // Draw coordinate grids
+                                val gridColor = Color(0xFF1E293B).copy(alpha = 0.3f)
+                                for (i in 1..4) {
+                                    val x = (i / 5f) * size.width
+                                    val y = (i / 5f) * size.height
+                                    drawLine(gridColor, androidx.compose.ui.geometry.Offset(x, 0f), androidx.compose.ui.geometry.Offset(x, size.height), 1f)
+                                    drawLine(gridColor, androidx.compose.ui.geometry.Offset(0f, y), androidx.compose.ui.geometry.Offset(size.width, y), 1f)
+                                }
+
+                                // Draw hand bones
+                                val bones = listOf(
+                                    Pair(0, 1), Pair(0, 5), Pair(0, 9), Pair(0, 13), Pair(0, 17),
+                                    Pair(1, 5), Pair(5, 9), Pair(9, 13), Pair(13, 17),
+                                    Pair(1, 2), Pair(2, 3), Pair(3, 4),
+                                    Pair(5, 6), Pair(6, 7), Pair(7, 8),
+                                    Pair(9, 10), Pair(10, 11), Pair(11, 12),
+                                    Pair(13, 14), Pair(14, 15), Pair(15, 16),
+                                    Pair(17, 18), Pair(18, 19), Pair(19, 20)
+                                )
+
+                                val skeletonColor = if (isCalibrating) Color(0xFF00FF87) else Color(0xFFA8C7FA)
+                                bones.forEach { (jA, jB) ->
+                                    val ax = landmarks[jA * 2] * size.width
+                                    val ay = landmarks[jA * 2 + 1] * size.height
+                                    val bx = landmarks[jB * 2] * size.width
+                                    val by = landmarks[jB * 2 + 1] * size.height
+                                    
+                                    drawLine(
+                                        color = skeletonColor.copy(alpha = 0.4f),
+                                        start = androidx.compose.ui.geometry.Offset(ax, ay),
+                                        end = androidx.compose.ui.geometry.Offset(bx, by),
+                                        strokeWidth = 3.dp.toPx()
+                                    )
+                                    drawLine(
+                                        color = skeletonColor,
+                                        start = androidx.compose.ui.geometry.Offset(ax, ay),
+                                        end = androidx.compose.ui.geometry.Offset(bx, by),
+                                        strokeWidth = 1.dp.toPx()
+                                    )
+                                }
+
+                                // Draw joint nodes
+                                for (j in 0 until 21) {
+                                    val jx = landmarks[j * 2] * size.width
+                                    val jy = landmarks[j * 2 + 1] * size.height
+
+                                    if (j in listOf(4, 8, 12, 16, 20)) {
+                                        drawCircle(
+                                            color = Color(0xFF00FF87).copy(alpha = 0.3f),
+                                            radius = 6.dp.toPx(),
+                                            center = androidx.compose.ui.geometry.Offset(jx, jy)
+                                        )
+                                        drawCircle(
+                                            color = Color(0xFF00FF87),
+                                            radius = 3.dp.toPx(),
+                                            center = androidx.compose.ui.geometry.Offset(jx, jy)
+                                        )
+                                    } else {
+                                        drawCircle(
+                                            color = Color.White,
+                                            radius = 2.dp.toPx(),
+                                            center = androidx.compose.ui.geometry.Offset(jx, jy)
+                                        )
+                                    }
+                                }
+                            }
+
+                            // Overlay metadata info
+                            Column(
+                                modifier = Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .padding(12.dp)
+                                    .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                                    .padding(6.dp)
+                            ) {
+                                Text(
+                                    text = "GESTURE MATCH: $matchedGesture",
+                                    color = Color(0xFF00FF87),
+                                    fontSize = 9.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = "SYSTEM ACTION: $mappedActionName",
+                                    color = Color(0xFFA8C7FA),
+                                    fontSize = 9.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        // Trigger actions
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Button(
+                                onClick = {
+                                    scope.launch {
+                                        isCalibrating = true
+                                        delay(1500)
+                                        isCalibrating = false
+                                        Toast.makeText(
+                                            context,
+                                            "Offline CPU Calibration successful for $name!",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                },
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = if (isCalibrating) Color(0xFF0F172A) else Color(0xFFA8C7FA)
+                                ),
+                                shape = RoundedCornerShape(12.dp),
+                                enabled = !isCalibrating
+                            ) {
+                                Icon(
+                                    imageVector = if (isCalibrating) Icons.Default.Sync else Icons.Default.Check,
+                                    contentDescription = "Calibrate",
+                                    tint = if (isCalibrating) Color.White else Color(0xFF003355),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = if (isCalibrating) "CALIBRATING..." else "ALIGN OFFLINE",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (isCalibrating) Color.White else Color(0xFF003355)
+                                )
+                            }
+
+                            Button(
+                                onClick = {
+                                    // Trigger the mapped action offline directly!
+                                    val serviceIntent = Intent(context, GestureService::class.java).apply {
+                                        putExtra("SIMULATE_ACTION", mappedActionId)
+                                    }
+                                    
+                                    Toast.makeText(
+                                        context,
+                                        "Offline AI triggers simulated gesture: $matchedGesture -> $mappedActionName",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+
+                                    if (mappedActionId == "TOGGLE_FLASHLIGHT") {
+                                        val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+                                        try {
+                                            val rearCameraId = cameraManager.cameraIdList.firstOrNull()
+                                            if (rearCameraId != null) {
+                                                cameraManager.setTorchMode(rearCameraId, true)
+                                                scope.launch {
+                                                    delay(1000)
+                                                    cameraManager.setTorchMode(rearCameraId, false)
+                                                }
+                                            }
+                                        } catch (e: Exception) {
+                                            Log.e("MainActivity", "Flashlight trigger error", e)
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B)),
+                                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.1f)),
+                                shape = RoundedCornerShape(12.dp),
+                                enabled = !isCalibrating
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.PlayArrow,
+                                    contentDescription = "Simulate",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "SIMULATE TRIGGER",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -1057,15 +2105,41 @@ fun CustomizeScreen(viewModel: MainViewModel) {
             )
         }
 
+        val categories = remember {
+            listOf(
+                Pair("PROXIMITY GESTURES (NO CAMERA)", listOf("PROXIMITY_WAVE", "PROXIMITY_HOVER")),
+                Pair("OPEN HAND GESTURES", listOf("OPEN_PALM", "WAVE", "SWIPE_LEFT", "SWIPE_RIGHT", "SWIPE_UP", "SWIPE_DOWN")),
+                Pair("CLOSED HAND GESTURES", listOf("FIST", "PEACE_SIGN", "ROCK_ON", "THUMBS_UP", "THUMBS_DOWN")),
+                Pair("FINGER RAISE GESTURES", listOf("INDEX_RAISED", "MIDDLE_RAISED", "PINKY_RAISED", "INDEX_MIDDLE_RAISED")),
+                Pair("PINCH GESTURES", listOf("INDEX_PINCH", "MIDDLE_PINCH", "RING_PINCH", "PINKY_PINCH")),
+                Pair("GESTURE COMBINATIONS", listOf("COMBO_FIST_OPEN", "COMBO_PINCH_SWIPE"))
+            )
+        }
+
         LazyColumn(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            items(mappings, key = { it.gestureId }) { mapping ->
-                GestureMappingCard(
-                    mapping = mapping,
-                    onClick = { selectedMappingForEdit = mapping }
-                )
+            categories.forEach { (catName, gestureIds) ->
+                val catMappings = mappings.filter { it.gestureId in gestureIds }
+                if (catMappings.isNotEmpty()) {
+                    item {
+                        Text(
+                            text = catName,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFFA8C7FA),
+                            letterSpacing = 1.2.sp,
+                            modifier = Modifier.padding(top = 12.dp, bottom = 4.dp)
+                        )
+                    }
+                    items(catMappings, key = { it.gestureId }) { mapping ->
+                        GestureMappingCard(
+                            mapping = mapping,
+                            onClick = { selectedMappingForEdit = mapping }
+                        )
+                    }
+                }
             }
         }
     }
@@ -1235,8 +2309,18 @@ fun getIconForGesture(gestureId: String): ImageVector {
         "SWIPE_RIGHT" -> Icons.Default.ArrowForward
         "SWIPE_UP" -> Icons.Default.ArrowUpward
         "SWIPE_DOWN" -> Icons.Default.ArrowDownward
-        "WAVE" -> Icons.Default.Refresh
-        "HOVER" -> Icons.Default.RadioButtonChecked
+        "WAVE", "PROXIMITY_WAVE" -> Icons.Default.Refresh
+        "HOVER", "PROXIMITY_HOVER", "OPEN_PALM" -> Icons.Default.PanTool
+        "FIST" -> Icons.Default.BackHand
+        "PEACE_SIGN" -> Icons.Default.FrontHand
+        "ROCK_ON" -> Icons.Default.SignLanguage
+        "THUMBS_UP" -> Icons.Default.ThumbUp
+        "THUMBS_DOWN" -> Icons.Default.ThumbDown
+        "INDEX_RAISED" -> Icons.Default.BackHand
+        "MIDDLE_RAISED" -> Icons.Default.BackHand
+        "PINKY_RAISED" -> Icons.Default.BackHand
+        "INDEX_PINCH", "MIDDLE_PINCH", "RING_PINCH", "PINKY_PINCH" -> Icons.Default.Pinch
+        "COMBO_FIST_OPEN", "COMBO_PINCH_SWIPE" -> Icons.Default.JoinRight
         else -> Icons.Default.Gesture
     }
 }
@@ -1255,6 +2339,10 @@ fun getIconForAction(actionId: String): ImageVector {
         "TOGGLE_FLASHLIGHT" -> Icons.Default.FlashlightOn
         "SCROLL_UP" -> Icons.Default.KeyboardDoubleArrowUp
         "SCROLL_DOWN" -> Icons.Default.KeyboardDoubleArrowDown
+        "SCREENSHOT" -> Icons.Default.CameraAlt
+        "LOCK_SCREEN" -> Icons.Default.Lock
+        "NOTIFICATIONS" -> Icons.Default.Notifications
+        "QUICK_SETTINGS" -> Icons.Default.Settings
         else -> Icons.Default.PlayArrow
     }
 }

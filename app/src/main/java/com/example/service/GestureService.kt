@@ -11,6 +11,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.graphics.PixelFormat
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.os.Build
@@ -30,6 +34,13 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.repeatable
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
@@ -87,14 +98,20 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.sqrt
+import kotlin.math.abs
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.foundation.border
 
-class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStateRegistryOwner {
+class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStateRegistryOwner, SensorEventListener, android.content.SharedPreferences.OnSharedPreferenceChangeListener {
 
     private lateinit var lifecycleRegistry: LifecycleRegistry
     private val store = ViewModelStore()
@@ -122,11 +139,16 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
     private var isFlashlightOn = false
     private var isTrackingPaused = false
     private var gestureDetectorInstance: GestureDetector? = null
-    
-    private var wasPinching = false
-    private var lastPinchX = 0f
-    private var lastPinchY = 0f
-    private var lastScrollTime = 0L
+    private var lastActivityTime = System.currentTimeMillis()
+    private var inactivityJob: kotlinx.coroutines.Job? = null
+
+    private var isPinchScrolling = false
+    private var startPinchY = 0f
+
+    private var sensorManager: SensorManager? = null
+    private var proximitySensor: Sensor? = null
+    private var isProximityActive = false
+    private var proximityNearStartTime = 0L
 
 
     companion object {
@@ -179,8 +201,10 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
         val motionGrid = MutableStateFlow(FloatArray(24 * 18))
         val handDetected = MutableStateFlow(false)
         val handSkeleton = MutableStateFlow<FloatArray?>(null)
-        val isPinching = MutableStateFlow(false)
-        val pinchCoordinates = MutableStateFlow<Pair<Float, Float>?>(null)
+        val imageWidth = MutableStateFlow(480)
+        val imageHeight = MutableStateFlow(640)
+        val indicatorStatus = MutableStateFlow<String>("searching")
+        val isBatterySaverSleeping = MutableStateFlow(false)
     }
 
     override fun onCreate() {
@@ -197,6 +221,9 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
         createNotificationChannel()
         startForegroundServiceWithNotification()
 
+        val prefs = getSharedPreferences("aura_prefs", Context.MODE_PRIVATE)
+        prefs.registerOnSharedPreferenceChangeListener(this)
+
         // Load custom mappings reactively from database
         serviceScope.launch {
             val db = AppDatabase.getDatabase(this@GestureService)
@@ -210,6 +237,9 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && android.provider.Settings.canDrawOverlays(this)) {
             showFloatingOverlay()
         }
+
+        lastActivityTime = System.currentTimeMillis()
+        startInactivityMonitoring()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -231,8 +261,15 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
         gestureDetectorInstance?.close()
         gestureDetectorInstance = null
         removeFloatingOverlay()
+        removePointerOverlay()
 
-        
+        val prefs = getSharedPreferences("aura_prefs", Context.MODE_PRIVATE)
+        prefs.unregisterOnSharedPreferenceChangeListener(this)
+        if (isProximityActive) {
+            sensorManager?.unregisterListener(this)
+            isProximityActive = false
+        }
+
         // Turn off flashlight if left on
         if (isFlashlightOn) {
             toggleFlashlight(forceOff = true)
@@ -282,6 +319,13 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
     }
 
     private fun startCameraTracking() {
+        val prefs = getSharedPreferences("aura_prefs", Context.MODE_PRIVATE)
+        val proximityModeEnabled = prefs.getBoolean("proximity_mode_enabled", false)
+        if (proximityModeEnabled) {
+            updateProximityAndCameraState()
+            return
+        }
+
         try {
             val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
             cameraProviderFuture.addListener({
@@ -298,6 +342,10 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
     }
 
     private fun bindCameraUseCases() {
+        val prefs = getSharedPreferences("aura_prefs", Context.MODE_PRIVATE)
+        val proximityModeEnabled = prefs.getBoolean("proximity_mode_enabled", false)
+        if (proximityModeEnabled) return
+
         val cameraProvider = cameraProvider ?: return
         val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
 
@@ -322,7 +370,9 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
                 centroidY: Float?,
                 motionDensity: Float,
                 handDetected: Boolean,
-                handSkeleton: FloatArray?
+                handSkeleton: FloatArray?,
+                imgW: Int,
+                imgH: Int
             ) {
                 if (isTrackingPaused) return
                 
@@ -331,10 +381,35 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
                 GestureService.centroid.value = if (handDetected && centroidX != null && centroidY != null) Pair(centroidX, centroidY) else null
                 GestureService.handDetected.value = handDetected
                 GestureService.handSkeleton.value = if (handDetected) handSkeleton else null
+                GestureService.imageWidth.value = imgW
+                GestureService.imageHeight.value = imgH
+
+                if (handDetected) {
+                    resetInactivityTimer()
+                }
+
+                if (handDetected && handSkeleton != null) {
+                    serviceScope.launch(Dispatchers.Main) {
+                        updatePointerOverlay(handSkeleton)
+                    }
+                } else {
+                    serviceScope.launch(Dispatchers.Main) {
+                        isCursorVisible.value = false
+                        isHandPointerActive = false
+                        isScrollPinching = false
+                        isGestureActiveFromDetector = false
+                        GestureService.indicatorStatus.value = "searching"
+                    }
+                }
             }
 
             override fun onGestureDetected(gestureId: String) {
                 if (isTrackingPaused) return
+                resetInactivityTimer()
+                if (isHandPointerActive) {
+                    Log.d("GestureService", "Gesture ignored because air pointer is active: $gestureId")
+                    return
+                }
                 
                 val mapping = gestureMappings[gestureId]
                 val actionId = mapping?.actionId ?: "NONE"
@@ -345,44 +420,10 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
 
                 Log.d("GestureService", "Detected $gestureId -> triggering $actionId")
                 
+                setGestureActiveIndicator()
+
                 serviceScope.launch(Dispatchers.Main) {
                     executeAction(actionId)
-                }
-            }
-
-            override fun onPinchStateChanged(isPinch: Boolean, pinchX: Float, pinchY: Float) {
-                if (isTrackingPaused) return
-                
-                GestureService.isPinching.value = isPinch
-                GestureService.pinchCoordinates.value = if (isPinch) Pair(pinchX, pinchY) else null
-
-                if (isPinch) {
-                    val accService = GestureAccessibilityService.instance
-                    if (accService != null) {
-                        if (!wasPinching) {
-                            lastPinchX = pinchX
-                            lastPinchY = pinchY
-                            wasPinching = true
-                            lastScrollTime = System.currentTimeMillis()
-                        } else {
-                            val now = System.currentTimeMillis()
-                            if (now - lastScrollTime > 160L) {
-                                val dx = pinchX - lastPinchX
-                                val dy = pinchY - lastPinchY
-
-                                if (kotlin.math.abs(dx) > 0.015f || kotlin.math.abs(dy) > 0.015f) {
-                                    val success = accService.dispatchDragGesture(dx, dy)
-                                    if (success) {
-                                        lastPinchX = pinchX
-                                        lastPinchY = pinchY
-                                        lastScrollTime = now
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    wasPinching = false
                 }
             }
         })
@@ -401,7 +442,7 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
 
     private fun executeAction(actionId: String) {
         when (actionId) {
-            "BACK", "HOME", "RECENTS", "SCROLL_UP", "SCROLL_DOWN" -> {
+            "BACK", "HOME", "RECENTS", "SCROLL_UP", "SCROLL_DOWN", "SCREENSHOT", "LOCK_SCREEN", "NOTIFICATIONS", "QUICK_SETTINGS" -> {
                 val accService = GestureAccessibilityService.instance
                 if (accService != null) {
                     accService.performNavigation(actionId)
@@ -497,7 +538,7 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
                         motionGridFlow = GestureService.motionGrid,
                         handDetectedFlow = GestureService.handDetected,
                         handSkeletonFlow = GestureService.handSkeleton,
-                        isPinchingFlow = GestureService.isPinching,
+                        indicatorStatusFlow = GestureService.indicatorStatus,
                         isPaused = isTrackingPaused,
                         onTogglePause = {
                             isTrackingPaused = !isTrackingPaused
@@ -541,6 +582,545 @@ class GestureService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStat
         }
         overlayView = null
     }
+
+    private var pointerView: ComposeView? = null
+    private var pointerParams: WindowManager.LayoutParams? = null
+    private var cursorX = 500f
+    private var cursorY = 1000f
+    private var centerX = 0.5f
+    private var centerY = 0.5f
+    private var isJoystickCenterCaptured = false
+    private var lastClickTime = 0L
+
+    private var isPinching = false
+    private var pinchStartX = 0f
+    private var pinchStartY = 0f
+    private var pinchStartTime = 0L
+    private var hasTriggeredLongPress = false
+
+    private var isHandPointerActive = false
+    private var isScrollPinching = false
+    private var lastTipX = 0f
+    private var lastTipY = 0f
+    private var isPointerTrackingFirstFrame = true
+    private var lastPointingOrPinchingTime = 0L
+    private var scrollStartHandX = 0f
+    private var scrollStartHandY = 0f
+
+    private var gestureResetJob: kotlinx.coroutines.Job? = null
+    private var isGestureActiveFromDetector = false
+
+    private fun setGestureActiveIndicator() {
+        isGestureActiveFromDetector = true
+        gestureResetJob?.cancel()
+        gestureResetJob = serviceScope.launch(Dispatchers.Main) {
+            kotlinx.coroutines.delay(1200)
+            isGestureActiveFromDetector = false
+            updateIndicatorStatus()
+        }
+        updateIndicatorStatus()
+    }
+
+    private fun updateIndicatorStatus() {
+        val hasHand = GestureService.handDetected.value
+        if (!hasHand) {
+            GestureService.indicatorStatus.value = "searching"
+            return
+        }
+
+        if (isScrollPinching || isGestureActiveFromDetector) {
+            GestureService.indicatorStatus.value = "gesture"
+        } else if (isHandPointerActive) {
+            GestureService.indicatorStatus.value = "pointer"
+        } else {
+            GestureService.indicatorStatus.value = "detected"
+        }
+    }
+
+    private val isCursorVisible = MutableStateFlow(false)
+    private val clickAnimationTrigger = MutableStateFlow(false)
+
+    private fun showPointerOverlay() {
+        if (pointerView != null) return
+
+        val displayMetrics = resources.displayMetrics
+        val screenWidth = displayMetrics.widthPixels
+        val screenHeight = displayMetrics.heightPixels
+
+        cursorX = screenWidth / 2f
+        cursorY = screenHeight / 2f
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            else
+                WindowManager.LayoutParams.TYPE_PHONE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = cursorX.toInt()
+            y = cursorY.toInt()
+        }
+        pointerParams = params
+
+        val composeView = ComposeView(this).apply {
+            setViewTreeLifecycleOwner(this@GestureService)
+            setViewTreeViewModelStoreOwner(this@GestureService)
+            setViewTreeSavedStateRegistryOwner(this@GestureService)
+            setContent {
+                MyApplicationTheme {
+                    PointerCursorView(isCursorVisible, clickAnimationTrigger)
+                }
+            }
+        }
+        pointerView = composeView
+        try {
+            windowManager.addView(composeView, params)
+        } catch (e: Exception) {
+            Log.e("GestureService", "Failed to add pointer view", e)
+        }
+    }
+
+    private fun removePointerOverlay() {
+        pointerView?.let {
+            try {
+                windowManager.removeView(it)
+            } catch (e: Exception) {
+                Log.e("GestureService", "Failed to remove pointer view", e)
+            }
+        }
+        pointerView = null
+        pointerParams = null
+    }
+
+    private fun triggerCursorClickAnimation() {
+        serviceScope.launch {
+            clickAnimationTrigger.value = true
+            kotlinx.coroutines.delay(300)
+            clickAnimationTrigger.value = false
+        }
+    }
+
+    private fun updatePointerOverlay(sk: FloatArray) {
+        val prefs = getSharedPreferences("aura_prefs", Context.MODE_PRIVATE)
+        val pointerEnabled = prefs.getBoolean("pointer_enabled", true)
+        if (!pointerEnabled) {
+            removePointerOverlay()
+            return
+        }
+
+        if (pointerView == null) {
+            showPointerOverlay()
+        }
+
+        val displayMetrics = resources.displayMetrics
+        val screenWidth = displayMetrics.widthPixels.toFloat()
+        val screenHeight = displayMetrics.heightPixels.toFloat()
+
+        fun jointDist(j1: Int, j2: Int): Float {
+            val dx = sk[j1 * 2] - sk[j2 * 2]
+            val dy = sk[j1 * 2 + 1] - sk[j2 * 2 + 1]
+            return sqrt(dx * dx + dy * dy)
+        }
+
+        val handSize = jointDist(0, 9)
+        
+        // Hysteresis thresholds to keep tracking super smooth when fingers fold/pinch
+        val wasTracking = isHandPointerActive || isScrollPinching || isPinching
+        val minHandSize = if (wasTracking) 0.035f else 0.055f
+        val minUprightRatio = if (wasTracking) 0.40f else 0.60f
+        val maxKnuckleY = if (wasTracking) 0.90f else 0.82f
+        
+        val isUpright = (sk[0 * 2 + 1] - sk[9 * 2 + 1]) > handSize * minUprightRatio
+        val isNotInLowerEdge = sk[9 * 2 + 1] < maxKnuckleY
+        
+        if (handSize < minHandSize || !isUpright || !isNotInLowerEdge) {
+            isCursorVisible.value = false
+            isHandPointerActive = false
+            isScrollPinching = false
+            isPointerTrackingFirstFrame = true
+            GestureService.indicatorStatus.value = "searching"
+            return
+        }
+
+        val isIndexRaised = jointDist(0, 8) > jointDist(0, 6) * 1.05f
+        val isMiddleRaised = jointDist(0, 12) > jointDist(0, 10) * 1.05f
+        val isIndexPinch = jointDist(4, 8) < (handSize * 0.22f).coerceIn(0.025f, 0.055f)
+        val isThumbRaised = jointDist(4, 9) > jointDist(2, 9) * 1.15f
+
+        val isPointingPose = isIndexRaised && !isMiddleRaised
+
+        val currentTime = System.currentTimeMillis()
+        if (isPointingPose || isIndexPinch) {
+            lastPointingOrPinchingTime = currentTime
+        }
+
+        // Determine if we should be in Hand Pointer mode
+        if (isPointingPose) {
+            isHandPointerActive = true
+        } else {
+            // Check if we are outside the grace period (500ms) and not pinching
+            val timeSinceLastActive = currentTime - lastPointingOrPinchingTime
+            if (timeSinceLastActive > 500L && !isIndexPinch) {
+                isHandPointerActive = false
+            }
+        }
+
+        // Only show pointer overlay when in hand pointer mode
+        isCursorVisible.value = isHandPointerActive
+
+        val pointerMode = prefs.getString("pointer_mode", "absolute") ?: "absolute"
+
+        if (isHandPointerActive) {
+            // Move cursor if index is raised (pointing pose) and thumb is NOT raised, OR if we are pinching (needed to drag!)
+            val shouldMoveCursor = (isPointingPose && !isThumbRaised) || isIndexPinch
+            if (shouldMoveCursor) {
+                val currentTipX = sk[5 * 2]
+                val currentTipY = sk[5 * 2 + 1]
+                if (pointerMode == "joystick") {
+                    if (!isJoystickCenterCaptured) {
+                        centerX = currentTipX
+                        centerY = currentTipY
+                        isJoystickCenterCaptured = true
+                    } else {
+                        val dx = currentTipX - centerX
+                        val dy = currentTipY - centerY
+                        val speed = 45f
+                        if (abs(dx) > 0.02f || abs(dy) > 0.02f) {
+                            cursorX = (cursorX + dx * speed).coerceIn(0f, screenWidth)
+                            cursorY = (cursorY + dy * speed).coerceIn(0f, screenHeight)
+                        }
+                    }
+                } else {
+                    // Absolute mode behaves as smooth relative tracking to support user's requirement (starts from last position)
+                    if (isPointerTrackingFirstFrame) {
+                        lastTipX = currentTipX
+                        lastTipY = currentTipY
+                        isPointerTrackingFirstFrame = false
+                    } else {
+                        val dx = currentTipX - lastTipX
+                        val dy = currentTipY - lastTipY
+                        val sensitivity = 1.6f
+                        cursorX = (cursorX + dx * screenWidth * sensitivity).coerceIn(0f, screenWidth)
+                        cursorY = (cursorY + dy * screenHeight * sensitivity).coerceIn(0f, screenHeight)
+                        lastTipX = currentTipX
+                        lastTipY = currentTipY
+                    }
+                    isJoystickCenterCaptured = false
+                }
+            } else {
+                isJoystickCenterCaptured = false
+                isPointerTrackingFirstFrame = true
+            }
+
+            // Pointer Pinch Actions (Click, Drag, Long Press) using isIndexPinch
+            if (isIndexPinch) {
+                if (!isPinching) {
+                    isPinching = true
+                    pinchStartX = cursorX
+                    pinchStartY = cursorY
+                    pinchStartTime = System.currentTimeMillis()
+                    hasTriggeredLongPress = false
+                } else {
+                    val distanceMoved = sqrt((cursorX - pinchStartX) * (cursorX - pinchStartX) + (cursorY - pinchStartY) * (cursorY - pinchStartY))
+                    if (!hasTriggeredLongPress && (System.currentTimeMillis() - pinchStartTime > 600) && distanceMoved <= 30f) {
+                        hasTriggeredLongPress = true
+                        GestureAccessibilityService.instance?.performLongPress(pinchStartX, pinchStartY)
+                        triggerCursorClickAnimation()
+                    }
+                }
+            } else {
+                if (isPinching) {
+                    isPinching = false
+                    val distanceMoved = sqrt((cursorX - pinchStartX) * (cursorX - pinchStartX) + (cursorY - pinchStartY) * (cursorY - pinchStartY))
+                    if (hasTriggeredLongPress) {
+                        // Long press was already executed
+                    } else if (distanceMoved > 30f) {
+                        // Perform Drag
+                        GestureAccessibilityService.instance?.performDrag(pinchStartX, pinchStartY, cursorX, cursorY)
+                    } else {
+                        // Perform Click
+                        GestureAccessibilityService.instance?.performClick(pinchStartX, pinchStartY)
+                        triggerCursorClickAnimation()
+                    }
+                }
+            }
+        } else {
+            isJoystickCenterCaptured = false
+            isPinching = false
+        }
+
+        // Open Hand Pinch Scroll (scrolling in any direction)
+        if (!isHandPointerActive) {
+            if (isIndexPinch) {
+                if (!isScrollPinching) {
+                    isScrollPinching = true
+                    scrollStartHandX = sk[5 * 2]
+                    scrollStartHandY = sk[5 * 2 + 1]
+                } else {
+                    val currentHandX = sk[5 * 2]
+                    val currentHandY = sk[5 * 2 + 1]
+                    val dx = currentHandX - scrollStartHandX
+                    val dy = currentHandY - scrollStartHandY
+
+                    // Scroll threshold (adjusted for sensitivity: 0.05f is perfect)
+                    val threshold = 0.05f
+                    if (abs(dx) > threshold || abs(dy) > threshold) {
+                        if (abs(dx) > abs(dy)) {
+                            // Horizontal scroll
+                            if (dx > threshold) {
+                                // Hand moved right -> swipe right (Scroll Left)
+                                val startX = screenWidth * 0.2f
+                                val endX = screenWidth * 0.8f
+                                GestureAccessibilityService.instance?.performSwipe(startX, screenHeight / 2f, endX, screenHeight / 2f)
+                            } else {
+                                // Hand moved left -> swipe left (Scroll Right)
+                                val startX = screenWidth * 0.8f
+                                val endX = screenWidth * 0.2f
+                                GestureAccessibilityService.instance?.performSwipe(startX, screenHeight / 2f, endX, screenHeight / 2f)
+                            }
+                        } else {
+                            // Vertical scroll
+                            if (dy > threshold) {
+                                // Hand moved down -> swipe down (Scroll Up)
+                                val startY = screenHeight * 0.2f
+                                val endY = screenHeight * 0.8f
+                                GestureAccessibilityService.instance?.performSwipe(screenWidth / 2f, startY, screenWidth / 2f, endY)
+                            } else {
+                                // Hand moved up -> swipe up (Scroll Down)
+                                val startY = screenHeight * 0.8f
+                                val endY = screenHeight * 0.2f
+                                GestureAccessibilityService.instance?.performSwipe(screenWidth / 2f, startY, screenWidth / 2f, endY)
+                            }
+                        }
+                        // Reset scroll baseline to current position to allow continuous scrolling
+                        scrollStartHandX = currentHandX
+                        scrollStartHandY = currentHandY
+                    }
+                }
+            } else {
+                isScrollPinching = false
+            }
+        } else {
+            isScrollPinching = false
+        }
+
+        // Update Layout Params
+        pointerParams?.let { params ->
+            params.x = cursorX.toInt()
+            params.y = cursorY.toInt()
+            pointerView?.let { view ->
+                try {
+                    windowManager.updateViewLayout(view, params)
+                } catch (e: Exception) {
+                    // Ignore
+                }
+            }
+        }
+
+        updateIndicatorStatus()
+    }
+
+    override fun onSharedPreferenceChanged(sharedPreferences: android.content.SharedPreferences?, key: String?) {
+        if (key == "proximity_mode_enabled") {
+            updateProximityAndCameraState()
+        } else if (key == "battery_saver_enabled" || key == "battery_saver_timeout") {
+            resetInactivityTimer()
+            val prefs = getSharedPreferences("aura_prefs", Context.MODE_PRIVATE)
+            val enabled = prefs.getBoolean("battery_saver_enabled", true)
+            if (!enabled && isBatterySaverSleeping.value) {
+                wakeFromEcoSleep()
+            }
+        }
+    }
+
+    private fun updateProximityAndCameraState() {
+        val prefs = getSharedPreferences("aura_prefs", Context.MODE_PRIVATE)
+        val proximityModeEnabled = prefs.getBoolean("proximity_mode_enabled", false)
+
+        if (proximityModeEnabled) {
+            // Unbind camera completely to save battery and hide camera indicator
+            try {
+                cameraProvider?.unbindAll()
+            } catch (e: Exception) {
+                Log.e("GestureService", "Error unbinding camera for proximity mode", e)
+            }
+            isTrackingPaused = true
+            
+            // Start Proximity Sensor
+            if (!isProximityActive) {
+                val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+                val sensor = sm.getDefaultSensor(Sensor.TYPE_PROXIMITY)
+                if (sensor != null) {
+                    sm.registerListener(this, sensor, SensorManager.SENSOR_DELAY_NORMAL)
+                    isProximityActive = true
+                    sensorManager = sm
+                    proximitySensor = sensor
+                    Log.d("GestureService", "Proximity Mode active: Camera released, Proximity Sensor registered.")
+                } else {
+                    Log.e("GestureService", "Proximity Sensor not found!")
+                }
+            }
+        } else {
+            isTrackingPaused = false
+            // Stop Proximity Sensor
+            if (isProximityActive) {
+                sensorManager?.unregisterListener(this)
+                isProximityActive = false
+                Log.d("GestureService", "Proximity Mode inactive: Proximity Sensor unregistered.")
+            }
+            // Re-bind camera use cases
+            bindCameraUseCases()
+        }
+    }
+
+    override fun onSensorChanged(event: SensorEvent?) {
+        if (event == null || event.sensor.type != Sensor.TYPE_PROXIMITY) return
+
+        val value = event.values[0]
+        val maxRange = event.sensor.maximumRange
+        // Is near? Typically value is less than 5.0 cm and less than maxRange
+        val isNear = value < maxRange && value < 5.0f
+
+        Log.d("GestureService", "Proximity sensor changed: value = $value, maxRange = $maxRange, isNear = $isNear")
+
+        if (isNear) {
+            if (isBatterySaverSleeping.value) {
+                wakeFromEcoSleep()
+                return
+            }
+        }
+
+        val now = System.currentTimeMillis()
+
+        if (isNear) {
+            if (proximityNearStartTime == 0L) {
+                proximityNearStartTime = now
+            }
+        } else {
+            val startTime = proximityNearStartTime
+            if (startTime > 0L) {
+                val duration = now - startTime
+                proximityNearStartTime = 0L
+
+                // Detect short wave vs longer hover
+                if (duration in 50L..700L) {
+                    // This is a "PROXIMITY_WAVE" gesture!
+                    GestureService.lastGesture.value = "PROXIMITY_WAVE"
+                    val mapping = gestureMappings["PROXIMITY_WAVE"]
+                    val actionId = mapping?.actionId ?: "NONE"
+                    val actionName = mapping?.actionName ?: "No Action"
+                    GestureService.lastAction.value = actionName
+                    
+                    Log.d("GestureService", "Proximity Wave detected -> Action: $actionId")
+                    serviceScope.launch(Dispatchers.Main) {
+                        executeAction(actionId)
+                    }
+                } else if (duration > 700L) {
+                    // This is a "PROXIMITY_HOVER" gesture!
+                    GestureService.lastGesture.value = "PROXIMITY_HOVER"
+                    val mapping = gestureMappings["PROXIMITY_HOVER"]
+                    val actionId = mapping?.actionId ?: "NONE"
+                    val actionName = mapping?.actionName ?: "No Action"
+                    GestureService.lastAction.value = actionName
+
+                    Log.d("GestureService", "Proximity Hover detected -> Action: $actionId")
+                    serviceScope.launch(Dispatchers.Main) {
+                        executeAction(actionId)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun resetInactivityTimer() {
+        lastActivityTime = System.currentTimeMillis()
+    }
+
+    private fun startInactivityMonitoring() {
+        inactivityJob?.cancel()
+        inactivityJob = serviceScope.launch(Dispatchers.Main) {
+            while (isActive) {
+                delay(1000)
+                checkInactivity()
+            }
+        }
+    }
+
+    private fun checkInactivity() {
+        val prefs = getSharedPreferences("aura_prefs", Context.MODE_PRIVATE)
+        val batterySaverEnabled = prefs.getBoolean("battery_saver_enabled", true)
+        val timeoutSeconds = prefs.getInt("battery_saver_timeout", 30)
+
+        if (!batterySaverEnabled || isBatterySaverSleeping.value || isTrackingPaused) {
+            return
+        }
+
+        val elapsedSeconds = (System.currentTimeMillis() - lastActivityTime) / 1000
+        if (elapsedSeconds >= timeoutSeconds) {
+            enterEcoSleepMode()
+        }
+    }
+
+    private fun enterEcoSleepMode() {
+        if (isBatterySaverSleeping.value) return
+        isBatterySaverSleeping.value = true
+        Log.d("GestureService", "Inactivity timeout reached! Entering Eco Sleep Mode...")
+
+        // Unbind camera entirely to save CPU and battery
+        try {
+            cameraProvider?.unbindAll()
+        } catch (e: Exception) {
+            Log.e("GestureService", "Failed to unbind camera for Eco Sleep", e)
+        }
+
+        // Clear gesture/hand visualization state
+        GestureService.handDetected.value = false
+        GestureService.handSkeleton.value = null
+        isCursorVisible.value = false
+        isHandPointerActive = false
+        isScrollPinching = false
+
+        // Register Proximity Sensor if not already registered (so we can wake up on wave)
+        if (!isProximityActive) {
+            val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+            val sensor = sm.getDefaultSensor(Sensor.TYPE_PROXIMITY)
+            if (sensor != null) {
+                sm.registerListener(this, sensor, SensorManager.SENSOR_DELAY_NORMAL)
+                isProximityActive = true
+                sensorManager = sm
+                proximitySensor = sensor
+                Log.d("GestureService", "Proximity Sensor registered for Eco Sleep wake up.")
+            }
+        }
+    }
+
+    private fun wakeFromEcoSleep() {
+        if (!isBatterySaverSleeping.value) return
+        isBatterySaverSleeping.value = false
+        Log.d("GestureService", "Waking up from Eco Sleep Mode...")
+
+        resetInactivityTimer()
+
+        // Unregister Proximity Sensor unless proximity mode is actually fully enabled
+        val prefs = getSharedPreferences("aura_prefs", Context.MODE_PRIVATE)
+        val proximityModeEnabled = prefs.getBoolean("proximity_mode_enabled", false)
+        if (!proximityModeEnabled && isProximityActive) {
+            sensorManager?.unregisterListener(this)
+            isProximityActive = false
+            Log.d("GestureService", "Unregistered proximity sensor after wake up.")
+        }
+
+        // Re-bind camera use cases
+        bindCameraUseCases()
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+        // No-op
+    }
 }
 
 @Composable
@@ -556,7 +1136,7 @@ fun FloatingOverlayContent(
     motionGridFlow: StateFlow<FloatArray>,
     handDetectedFlow: StateFlow<Boolean>,
     handSkeletonFlow: StateFlow<FloatArray?>,
-    isPinchingFlow: StateFlow<Boolean>,
+    indicatorStatusFlow: StateFlow<String>,
     isPaused: Boolean,
     onTogglePause: () -> Unit,
     onOpenApp: () -> Unit,
@@ -569,17 +1149,41 @@ fun FloatingOverlayContent(
     val motionGrid by motionGridFlow.collectAsState()
     val handDetected by handDetectedFlow.collectAsState()
     val handSkeleton by handSkeletonFlow.collectAsState()
-    val isPinching by isPinchingFlow.collectAsState()
+    val indicatorStatus by indicatorStatusFlow.collectAsState()
+    val isBatterySaverSleeping by GestureService.isBatterySaverSleeping.collectAsState()
+
+    val infiniteTransition = rememberInfiniteTransition(label = "scanline_and_pulse")
+    val pulseAlpha by infiniteTransition.animateFloat(
+        initialValue = 0.3f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1200, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulse_alpha"
+    )
+    val scanProgress by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(3000, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "scan_progress"
+    )
 
     val surfaceColor = Color(0xFF1E1E24).copy(alpha = 0.92f)
     val accentColor = if (isPaused) {
         Color(0xFFFFB4AB)
-    } else if (isPinching) {
-        Color(0xFFFF9100) // Glowing Gold/Orange when pinching/scrolling
-    } else if (handDetected) {
-        Color(0xFF00E676) // Glowing green when hand detected
+    } else if (isBatterySaverSleeping) {
+        Color(0xFFFF3B30) // Red when asleep due to battery saver
     } else {
-        Color(0xFF64748B) // Slate gray when searching
+        when (indicatorStatus) {
+            "pointer" -> Color(0xFF2196F3)     // Blue in air pointer mode
+            "gesture" -> Color(0xFFFF9800)     // Orange when doing gestures
+            "detected" -> Color(0xFF00E676)    // Green when hand detected
+            else -> Color(0xFF64748B)          // Slate gray when searching
+        }
     }
 
     Surface(
@@ -621,7 +1225,12 @@ fun FloatingOverlayContent(
                         .size(8.dp)
                         .align(Alignment.TopEnd)
                         .offset(x = (-8).dp, y = 8.dp)
-                        .background(if (isPaused) Color(0xFF94A3B8) else Color(0xFF22C55E), shape = CircleShape)
+                        .background(
+                            if (isPaused) Color(0xFF94A3B8)
+                            else if (isBatterySaverSleeping) Color(0xFFFF3B30)
+                            else Color(0xFF22C55E),
+                            shape = CircleShape
+                        )
                 )
             }
         } else {
@@ -638,12 +1247,22 @@ fun FloatingOverlayContent(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "Touchless OS",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .background(accentColor.copy(alpha = pulseAlpha), shape = CircleShape)
+                        )
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Text(
+                            text = "Touchless OS",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
+                    }
                     Row {
                         IconButton(
                             onClick = onToggleVisualizer,
@@ -673,7 +1292,43 @@ fun FloatingOverlayContent(
                 Spacer(modifier = Modifier.height(6.dp))
 
                 // Motion Visualizer Grid (Cyber heat-map)
-                if (showVisualizer && !isPaused) {
+                if (isBatterySaverSleeping) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(90.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color(0xFF2D0A0A).copy(alpha = 0.8f))
+                            .border(1.dp, Color(0xFFFF3B30).copy(alpha = 0.3f), RoundedCornerShape(8.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.padding(6.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(12.dp)
+                                    .background(Color(0xFFFF3B30).copy(alpha = pulseAlpha), shape = CircleShape)
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "ECO SLEEP MODE",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFFFF3B30),
+                                letterSpacing = 1.sp
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "Wave near proximity sensor",
+                                fontSize = 8.sp,
+                                color = Color.LightGray.copy(alpha = 0.8f),
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                            )
+                        }
+                    }
+                } else if (showVisualizer && !isPaused) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -706,6 +1361,9 @@ fun FloatingOverlayContent(
                             update = { },
                             modifier = Modifier.fillMaxSize()
                         )
+                        val imgW by GestureService.imageWidth.collectAsState()
+                        val imgH by GestureService.imageHeight.collectAsState()
+                        
                         Canvas(modifier = Modifier.fillMaxSize()) {
                             // Draw hand skeleton in floating HUD
                             handSkeleton?.let { skeleton ->
@@ -723,11 +1381,23 @@ fun FloatingOverlayContent(
                                     val glowColor = Color(0xFF00FF87)
                                     val boneColor = Color(0xFFE2E8F0)
 
+                                    // Map normalized frame coordinates with FILL_CENTER scaling logic
+                                    val scaleX = size.width / imgW
+                                    val scaleY = size.height / imgH
+                                    val scale = maxOf(scaleX, scaleY)
+                                    val scaledW = imgW * scale
+                                    val scaledH = imgH * scale
+                                    val offsetX = (size.width - scaledW) / 2f
+                                    val offsetY = (size.height - scaledH) / 2f
+
+                                    val mapX = { nx: Float -> nx * scaledW + offsetX }
+                                    val mapY = { ny: Float -> ny * scaledH + offsetY }
+
                                     bones.forEach { (jA, jB) ->
-                                        val ax = skeleton[jA * 2] * size.width
-                                        val ay = skeleton[jA * 2 + 1] * size.height
-                                        val bx = skeleton[jB * 2] * size.width
-                                        val by = skeleton[jB * 2 + 1] * size.height
+                                        val ax = mapX(skeleton[jA * 2])
+                                        val ay = mapY(skeleton[jA * 2 + 1])
+                                        val bx = mapX(skeleton[jB * 2])
+                                        val by = mapY(skeleton[jB * 2 + 1])
                                         
                                         drawLine(
                                             color = boneColor.copy(alpha = 0.4f),
@@ -743,29 +1413,9 @@ fun FloatingOverlayContent(
                                         )
                                     }
 
-                                    if (isPinching) {
-                                        val x4 = skeleton[4 * 2] * size.width
-                                        val y4 = skeleton[4 * 2 + 1] * size.height
-                                        val x8 = skeleton[8 * 2] * size.width
-                                        val y8 = skeleton[8 * 2 + 1] * size.height
-                                        // Draw a glowing orange line between index and thumb to show pinch connection
-                                        drawLine(
-                                            color = Color(0xFFFF9100),
-                                            start = androidx.compose.ui.geometry.Offset(x4, y4),
-                                            end = androidx.compose.ui.geometry.Offset(x8, y8),
-                                            strokeWidth = 3.dp.toPx()
-                                        )
-                                        // Draw a pulsing circle at the midpoint
-                                        drawCircle(
-                                            color = Color(0xFFFF9100),
-                                            radius = 4.dp.toPx(),
-                                            center = androidx.compose.ui.geometry.Offset((x4 + x8) / 2f, (y4 + y8) / 2f)
-                                        )
-                                    }
-
                                     for (j in 0 until 21) {
-                                        val jx = skeleton[j * 2] * size.width
-                                        val jy = skeleton[j * 2 + 1] * size.height
+                                        val jx = mapX(skeleton[j * 2])
+                                        val jy = mapY(skeleton[j * 2 + 1])
 
                                         if (j == 4 || j == 8 || j == 12 || j == 16 || j == 20) {
                                             drawCircle(
@@ -784,6 +1434,23 @@ fun FloatingOverlayContent(
                                 }
                             }
                         }
+                        
+                        // Scanning bar animation overlay
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(2.dp)
+                                .offset(y = 90.dp * scanProgress)
+                                .background(
+                                    brush = Brush.verticalGradient(
+                                        colors = listOf(
+                                            accentColor.copy(alpha = 0.1f),
+                                            accentColor.copy(alpha = 0.8f),
+                                            accentColor.copy(alpha = 0.1f)
+                                        )
+                                    )
+                                )
+                        )
                     }
                     Spacer(modifier = Modifier.height(6.dp))
                 }
@@ -795,17 +1462,31 @@ fun FloatingOverlayContent(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column(modifier = Modifier.padding(6.dp)) {
-                        Text(
-                            text = "Gesture: $lastGesture",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color.White
-                        )
-                        Text(
-                            text = "Action: $lastAction",
-                            fontSize = 10.sp,
-                            color = accentColor
-                        )
+                        if (isBatterySaverSleeping) {
+                            Text(
+                                text = "Camera: OFF (Saving Power)",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFFFF3B30)
+                            )
+                            Text(
+                                text = "Tracking: Suspended",
+                                fontSize = 9.sp,
+                                color = Color.Gray
+                            )
+                        } else {
+                            Text(
+                                text = "Gesture: $lastGesture",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color.White
+                            )
+                            Text(
+                                text = "Action: $lastAction",
+                                fontSize = 10.sp,
+                                color = accentColor
+                            )
+                        }
                     }
                 }
 
@@ -843,6 +1524,86 @@ fun FloatingOverlayContent(
                             modifier = Modifier.size(16.dp)
                         )
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun PointerCursorView(
+    isCursorVisible: StateFlow<Boolean>,
+    clickAnimationTrigger: StateFlow<Boolean>
+) {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("aura_prefs", Context.MODE_PRIVATE) }
+    
+    // States
+    val isVisible by isCursorVisible.collectAsState()
+    val isClicked by clickAnimationTrigger.collectAsState()
+    
+    val alpha by animateFloatAsState(targetValue = if (isVisible) 1f else 0f, label = "cursor_alpha")
+    val clickScale by animateFloatAsState(targetValue = if (isClicked) 1.4f else 1.0f, label = "click_scale")
+
+    val pointerColorStr = prefs.getString("pointer_color", "#00FF87") ?: "#00FF87"
+    val pointerSizeDp = prefs.getInt("pointer_size", 48)
+    val pointerShape = prefs.getString("pointer_shape", "crosshair") ?: "crosshair"
+
+    val color = Color(android.graphics.Color.parseColor(pointerColorStr))
+    val size = pointerSizeDp.dp
+
+    Box(
+        modifier = Modifier
+            .size(size)
+            .scale(clickScale)
+            .alpha(alpha)
+            .background(Color.Transparent),
+        contentAlignment = Alignment.Center
+    ) {
+        when (pointerShape) {
+            "dot" -> {
+                Box(
+                    modifier = Modifier
+                        .size(size / 3)
+                        .background(color, shape = CircleShape)
+                        .border(1.5.dp, Color.White, CircleShape)
+                )
+            }
+            "ring" -> {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .border(3.dp, color, CircleShape)
+                )
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .background(color, shape = CircleShape)
+                )
+            }
+            "arrow" -> {
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val path = androidx.compose.ui.graphics.Path().apply {
+                        moveTo(0f, 0f)
+                        lineTo(size.toPx(), size.toPx() * 0.5f)
+                        lineTo(size.toPx() * 0.4f, size.toPx() * 0.6f)
+                        close()
+                    }
+                    drawPath(path, color)
+                    drawPath(path, Color.White, style = Stroke(width = 1.dp.toPx()))
+                }
+            }
+            else -> {
+                // Crosshair
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .border(1.5.dp, color, CircleShape)
+                )
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val len = size.toPx()
+                    drawLine(color, androidx.compose.ui.geometry.Offset(0f, len / 2), androidx.compose.ui.geometry.Offset(len, len / 2), strokeWidth = 2f)
+                    drawLine(color, androidx.compose.ui.geometry.Offset(len / 2, 0f), androidx.compose.ui.geometry.Offset(len / 2, len), strokeWidth = 2f)
                 }
             }
         }

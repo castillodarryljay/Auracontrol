@@ -3,6 +3,7 @@ package com.example.service
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
+import android.os.Build
 import android.view.accessibility.AccessibilityEvent
 import android.util.Log
 
@@ -47,8 +48,74 @@ class GestureAccessibilityService : AccessibilityService() {
                 simulateSwipe(scrollUp = false)
                 true
             }
+            "SCREENSHOT" -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    performGlobalAction(GLOBAL_ACTION_TAKE_SCREENSHOT)
+                } else {
+                    false
+                }
+            }
+            "LOCK_SCREEN" -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
+                } else {
+                    false
+                }
+            }
+            "NOTIFICATIONS" -> performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+            "QUICK_SETTINGS" -> performGlobalAction(GLOBAL_ACTION_QUICK_SETTINGS)
             else -> false
         }
+    }
+
+    fun performClick(x: Float, y: Float): Boolean {
+        Log.d("GestureAccessibility", "Clicking at: ($x, $y)")
+        val path = Path().apply {
+            moveTo(x, y)
+        }
+        val stroke = GestureDescription.StrokeDescription(path, 0L, 50L)
+        val gestureDescription = GestureDescription.Builder()
+            .addStroke(stroke)
+            .build()
+        return dispatchGesture(gestureDescription, null, null)
+    }
+
+    fun performLongPress(x: Float, y: Float): Boolean {
+        Log.d("GestureAccessibility", "Long pressing at: ($x, $y)")
+        val path = Path().apply {
+            moveTo(x, y)
+        }
+        val stroke = GestureDescription.StrokeDescription(path, 0L, 800L)
+        val gestureDescription = GestureDescription.Builder()
+            .addStroke(stroke)
+            .build()
+        return dispatchGesture(gestureDescription, null, null)
+    }
+
+    fun performDrag(startX: Float, startY: Float, endX: Float, endY: Float): Boolean {
+        Log.d("GestureAccessibility", "Dragging from ($startX, $startY) to ($endX, $endY)")
+        val path = Path().apply {
+            moveTo(startX, startY)
+            lineTo(endX, endY)
+        }
+        val stroke = GestureDescription.StrokeDescription(path, 0L, 500L)
+        val gestureDescription = GestureDescription.Builder()
+            .addStroke(stroke)
+            .build()
+        return dispatchGesture(gestureDescription, null, null)
+    }
+
+    fun performSwipe(startX: Float, startY: Float, endX: Float, endY: Float): Boolean {
+        Log.d("GestureAccessibility", "Swiping from ($startX, $startY) to ($endX, $endY)")
+        val path = Path().apply {
+            moveTo(startX, startY)
+            lineTo(endX, endY)
+        }
+        val stroke = GestureDescription.StrokeDescription(path, 0L, 250L)
+        val gestureDescription = GestureDescription.Builder()
+            .addStroke(stroke)
+            .build()
+        return dispatchGesture(gestureDescription, null, null)
     }
 
     private fun simulateSwipe(scrollUp: Boolean) {
@@ -91,48 +158,6 @@ class GestureAccessibilityService : AccessibilityService() {
             override fun onCancelled(gestureDescription: GestureDescription?) {
                 super.onCancelled(gestureDescription)
                 Log.d("GestureAccessibility", "Swipe cancelled")
-            }
-        }, null)
-    }
-
-    fun dispatchDragGesture(deltaX: Float, deltaY: Float): Boolean {
-        val displayMetrics = resources.displayMetrics
-        val width = displayMetrics.widthPixels.toFloat()
-        val height = displayMetrics.heightPixels.toFloat()
-
-        val startX = width / 2f
-        val startY = height / 2f
-
-        // Map normalized coordinate changes. Camera input delta: positive dy means hand moved down, which drags content down (scrolling up).
-        // Let's add a robust sensitivity multiplier. 4.0f works wonderfully!
-        val sensitivity = 4.0f
-        
-        // We invert camera horizontal flip if needed, but for vertical scroll dy is directly mapped
-        val endX = (startX - deltaX * width * sensitivity).coerceIn(width * 0.05f, width * 0.95f)
-        val endY = (startY + deltaY * height * sensitivity).coerceIn(height * 0.05f, height * 0.95f)
-
-        // Prevent zero-length strokes
-        val dxPx = endX - startX
-        val dyPx = endY - startY
-        if (Math.hypot(dxPx.toDouble(), dyPx.toDouble()) < 10.0) {
-            return false
-        }
-
-        val path = Path().apply {
-            moveTo(startX, startY)
-            lineTo(endX, endY)
-        }
-
-        // We use a short duration of 100ms for fast real-time scroll dragging!
-        val stroke = GestureDescription.StrokeDescription(path, 0L, 100L)
-        val gestureDescription = GestureDescription.Builder()
-            .addStroke(stroke)
-            .build()
-
-        return dispatchGesture(gestureDescription, object : GestureResultCallback() {
-            override fun onCompleted(gestureDescription: GestureDescription?) {
-                super.onCompleted(gestureDescription)
-                Log.d("GestureAccessibility", "Real-time scroll drag completed")
             }
         }, null)
     }

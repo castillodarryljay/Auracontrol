@@ -28,10 +28,11 @@ class GestureDetector(
             centroidY: Float?,
             motionDensity: Float,   // Percentage of grid with motion (0.0 to 1.0)
             handDetected: Boolean,  // True if a hand is detected
-            handSkeleton: FloatArray? // 21-landmark hand skeleton (x, y) or null
+            handSkeleton: FloatArray?, // 21-landmark hand skeleton (x, y) or null
+            imageWidth: Int,
+            imageHeight: Int
         )
         fun onGestureDetected(gestureId: String)
-        fun onPinchStateChanged(isPinch: Boolean, pinchX: Float, pinchY: Float)
     }
 
     private val gridWidth = 32
@@ -53,9 +54,26 @@ class GestureDetector(
     private fun initDetector() {
         if (handLandmarker != null) return
         try {
-            val baseOptions = BaseOptions.builder()
+            // Pre-load native library to guarantee runtime resolution
+            try {
+                System.loadLibrary("mediapipe_tasks_vision_jni")
+                Log.d("GestureDetector", "Successfully pre-loaded mediapipe_tasks_vision_jni")
+            } catch (e: UnsatisfiedLinkError) {
+                Log.e("GestureDetector", "Manual System.loadLibrary failed, relying on MediaPipe's internal loader", e)
+            }
+
+            val baseOptionsBuilder = BaseOptions.builder()
                 .setModelAssetPath("hand_landmarker.task")
-                .build()
+            
+            try {
+                baseOptionsBuilder.setDelegate(com.google.mediapipe.tasks.core.Delegate.GPU)
+                Log.d("GestureDetector", "Successfully initialized with GPU delegate.")
+            } catch (e: Exception) {
+                baseOptionsBuilder.setDelegate(com.google.mediapipe.tasks.core.Delegate.CPU)
+                Log.w("GestureDetector", "GPU delegate failed, falling back to CPU", e)
+            }
+            
+            val baseOptions = baseOptionsBuilder.build()
             val options = HandLandmarkerOptions.builder()
                 .setBaseOptions(baseOptions)
                 .setMinHandDetectionConfidence(0.40f) // Keep it sensitive for fast offline tracking
@@ -76,10 +94,9 @@ class GestureDetector(
             val landmarker = handLandmarker
             if (landmarker == null) {
                 // Fallback: Notify listener that nothing is detected
-                listener.onPinchStateChanged(false, 0f, 0f)
                 listener.onMotionFrame(
                     gridWidth, gridHeight, FloatArray(gridWidth * gridHeight),
-                    null, null, 0f, false, null
+                    null, null, 0f, false, null, 480, 640
                 )
                 return
             }
@@ -131,105 +148,130 @@ class GestureDetector(
                 centroidX = sumX / 21
                 centroidY = sumY / 21
 
-                // Pinch detection between Thumb tip (4) and Index tip (8)
-                val thumbTipX = skeleton[4 * 2]
-                val thumbTipY = skeleton[4 * 2 + 1]
-                val indexTipX = skeleton[8 * 2]
-                val indexTipY = skeleton[8 * 2 + 1]
-                val pinchDist = Math.hypot((thumbTipX - indexTipX).toDouble(), (thumbTipY - indexTipY).toDouble()).toFloat()
-                
-                // Pinch threshold: < 0.065f in normalized coordinates
-                val isPinch = pinchDist < 0.065f
-                val pinchX = (thumbTipX + indexTipX) / 2f
-                val pinchY = (thumbTipY + indexTipY) / 2f
-                listener.onPinchStateChanged(isPinch, pinchX, pinchY)
-
                 // Temporal smoothing for smooth skeleton rendering
                 val smoothed = lastHandSkeleton?.let { last ->
                     FloatArray(42) { i ->
                         last[i] * 0.35f + skeleton[i] * 0.65f
                     }
                 } ?: skeleton
-                lastHandSkeleton = smoothed
-                handSkeleton = smoothed
 
-                // Render connections on the retro 32x24 grid
-                val connections = listOf(
-                    Pair(0, 1), Pair(1, 2), Pair(2, 3), Pair(3, 4), // Thumb
-                    Pair(0, 5), Pair(5, 6), Pair(6, 7), Pair(7, 8), // Index
-                    Pair(0, 9), Pair(9, 10), Pair(10, 11), Pair(11, 12), // Middle
-                    Pair(0, 13), Pair(13, 14), Pair(14, 15), Pair(15, 16), // Ring
-                    Pair(0, 17), Pair(17, 18), Pair(18, 19), Pair(19, 20), // Pinky
-                    Pair(5, 9), Pair(9, 13), Pair(13, 17) // Palm knuckles
-                )
+                val handSize = jointDistance(0, 9, smoothed)
+                
+                // Hysteresis thresholds to keep tracking smooth when fingers fold/pinch
+                val wasTracking = lastHandSkeleton != null
+                val minHandSize = if (wasTracking) 0.035f else 0.055f
+                val minUprightRatio = if (wasTracking) 0.40f else 0.60f
+                val maxKnuckleY = if (wasTracking) 0.90f else 0.82f
+                
+                val isNotTooFar = handSize >= minHandSize
+                // Check if the hand is upright (fingers pointing upwards): wrist y is below middle knuckle y
+                val isUpright = (smoothed[0 * 2 + 1] - smoothed[9 * 2 + 1]) > handSize * minUprightRatio
+                val isNotInLowerEdge = smoothed[9 * 2 + 1] < maxKnuckleY
+                val handIsRaised = isNotTooFar && isUpright && isNotInLowerEdge
 
-                var gridActiveCount = 0
-                for (gy in 0 until gridHeight) {
-                    for (gx in 0 until gridWidth) {
-                        val x = gx.toFloat() / (gridWidth - 1)
-                        val y = gy.toFloat() / (gridHeight - 1)
+                if (handIsRaised) {
+                    // Temporal smoothing for smooth skeleton rendering
+                    lastHandSkeleton = smoothed
+                    handSkeleton = smoothed
 
-                        // Shortest distance to any skeleton segment
-                        var minDistance = 1f
-                        for (conn in connections) {
-                            val p1X = skeleton[conn.first * 2]
-                            val p1Y = skeleton[conn.first * 2 + 1]
-                            val p2X = skeleton[conn.second * 2]
-                            val p2Y = skeleton[conn.second * 2 + 1]
+                    // Render connections on the retro 32x24 grid
+                    val connections = listOf(
+                        Pair(0, 1), Pair(1, 2), Pair(2, 3), Pair(3, 4), // Thumb
+                        Pair(0, 5), Pair(5, 6), Pair(6, 7), Pair(7, 8), // Index
+                        Pair(0, 9), Pair(9, 10), Pair(10, 11), Pair(11, 12), // Middle
+                        Pair(0, 13), Pair(13, 14), Pair(14, 15), Pair(15, 16), // Ring
+                        Pair(0, 17), Pair(17, 18), Pair(18, 19), Pair(19, 20), // Pinky
+                        Pair(5, 9), Pair(9, 13), Pair(13, 17) // Palm knuckles
+                    )
 
-                            val dist = distanceToSegment(x, y, p1X, p1Y, p2X, p2Y)
-                            if (dist < minDistance) {
-                                minDistance = dist
+                    var gridActiveCount = 0
+                    for (gy in 0 until gridHeight) {
+                        for (gx in 0 until gridWidth) {
+                            val x = gx.toFloat() / (gridWidth - 1)
+                            val y = gy.toFloat() / (gridHeight - 1)
+
+                            // Shortest distance to any skeleton segment
+                            var minDistance = 1f
+                            for (conn in connections) {
+                                val p1X = skeleton[conn.first * 2]
+                                val p1Y = skeleton[conn.first * 2 + 1]
+                                val p2X = skeleton[conn.second * 2]
+                                val p2Y = skeleton[conn.second * 2 + 1]
+
+                                val dist = distanceToSegment(x, y, p1X, p1Y, p2X, p2Y)
+                                if (dist < minDistance) {
+                                    minDistance = dist
+                                }
                             }
-                        }
 
-                        // Shortest distance to any joint
-                        for (i in 0 until 21) {
-                            val jX = skeleton[i * 2]
-                            val jY = skeleton[i * 2 + 1]
-                            val dist = Math.hypot((x - jX).toDouble(), (y - jY).toDouble()).toFloat()
-                            if (dist < minDistance) {
-                                minDistance = dist
+                            // Shortest distance to any joint
+                            for (i in 0 until 21) {
+                                val jX = skeleton[i * 2]
+                                val jY = skeleton[i * 2 + 1]
+                                val dist = Math.hypot((x - jX).toDouble(), (y - jY).toDouble()).toFloat()
+                                if (dist < minDistance) {
+                                    minDistance = dist
+                                }
                             }
-                        }
 
-                        val idx = gy * gridWidth + gx
-                        if (minDistance < 0.045f) {
-                            motionGrid[idx] = 1.0f // Draw active hand skeleton
-                            gridActiveCount++
-                        } else if (minDistance < 0.11f) {
-                            motionGrid[idx] = 0.22f // Draw faint halo/contour effect
-                        } else {
-                            motionGrid[idx] = 0.0f
+                            val idx = gy * gridWidth + gx
+                            if (minDistance < 0.045f) {
+                                motionGrid[idx] = 1.0f // Draw active hand skeleton
+                                gridActiveCount++
+                            } else if (minDistance < 0.11f) {
+                                motionGrid[idx] = 0.22f // Draw faint halo/contour effect
+                            } else {
+                                motionGrid[idx] = 0.0f
+                            }
                         }
                     }
-                }
-                motionDensity = gridActiveCount.toFloat() / (gridWidth * gridHeight)
 
-                // Gesture tracking: process frame count and centroid history
-                consecutiveMotionFrames++
-                consecutiveNoMotionFrames = 0
+                    motionDensity = gridActiveCount.toFloat() / (gridWidth * gridHeight)
 
-                centroidHistory.add(Pair(centroidX, centroidY))
-                if (centroidHistory.size > maxHistorySize) {
-                    centroidHistory.removeAt(0)
-                }
+                    // Gesture tracking: process frame count and centroid history
+                    consecutiveMotionFrames++
+                    consecutiveNoMotionFrames = 0
 
-                // AI landmarks are incredibly smooth, meaning we can detect gestures extremely fast with fewer frames
-                if (consecutiveMotionFrames >= 4) {
+                    centroidHistory.add(Pair(centroidX, centroidY))
+                    if (centroidHistory.size > maxHistorySize) {
+                        centroidHistory.removeAt(0)
+                    }
+
+                    // Evaluate gestures
                     val now = System.currentTimeMillis()
                     if (now - lastGestureTime > gestureCooldownMs) {
-                        val detected = evaluateRealtimeGesture()
-                        if (detected != null) {
-                            listener.onGestureDetected(detected)
+                        // Priority 1: Check static pose / pinch / combination gestures
+                        val staticGesture = evaluateStaticGesture(smoothed)
+                        if (staticGesture != null) {
+                            listener.onGestureDetected(staticGesture)
                             lastGestureTime = now
                             centroidHistory.clear()
                             consecutiveMotionFrames = 0
+                        } else if (consecutiveMotionFrames >= 4) {
+                            // Priority 2: Fallback to motion-based swipe or wave gestures
+                            val detected = evaluateRealtimeGesture()
+                            if (detected != null) {
+                                listener.onGestureDetected(detected)
+                                lastGestureTime = now
+                                centroidHistory.clear()
+                                consecutiveMotionFrames = 0
+                            }
                         }
                     }
+                } else {
+                    // Hand not raised intentionally -> Treat as no hand to avoid miss-tracking
+                    consecutiveNoMotionFrames++
+                    centroidHistory.clear()
+                    consecutiveMotionFrames = 0
+                    lastHandSkeleton = null
+                    // Still pass skeleton for faint preview visual but signal handDetected as false
+                    listener.onMotionFrame(
+                        gridWidth, gridHeight, FloatArray(gridWidth * gridHeight),
+                        null, null, 0f, false, smoothed, finalBitmap.width, finalBitmap.height
+                    )
+                    return
                 }
             } else {
-                listener.onPinchStateChanged(false, 0f, 0f)
                 consecutiveNoMotionFrames++
 
                 if (consecutiveNoMotionFrames >= 2 && consecutiveMotionFrames >= 2) {
@@ -260,7 +302,9 @@ class GestureDetector(
                 centroidY,
                 motionDensity,
                 handDetected,
-                handSkeleton
+                handSkeleton,
+                finalBitmap.width,
+                finalBitmap.height
             )
         } catch (e: Exception) {
             Log.e("GestureDetector", "Error in frame analysis", e)
@@ -339,6 +383,132 @@ class GestureDetector(
             }
         }
 
+        return null
+    }
+
+    private var lastBaseGesture = "None"
+    private var lastBaseGestureTime = 0L
+
+    fun jointDistance(j1: Int, j2: Int, sk: FloatArray): Float {
+        val dx = sk[j1 * 2] - sk[j2 * 2]
+        val dy = sk[j1 * 2 + 1] - sk[j2 * 2 + 1]
+        return sqrt(dx * dx + dy * dy)
+    }
+
+    private fun evaluateStaticGesture(sk: FloatArray): String? {
+        val staticPose = evaluateStaticPoseOnly(sk)
+        if (staticPose != null) {
+            val now = System.currentTimeMillis()
+            if (now - lastBaseGestureTime < 1800) {
+                if (lastBaseGesture == "FIST" && staticPose == "OPEN_PALM") {
+                    lastBaseGesture = "None"
+                    return "COMBO_FIST_OPEN"
+                }
+                if (lastBaseGesture == "INDEX_PINCH" && staticPose == "SWIPE_UP") {
+                    lastBaseGesture = "None"
+                    return "COMBO_PINCH_SWIPE"
+                }
+            }
+            if (staticPose != lastBaseGesture) {
+                lastBaseGesture = staticPose
+                lastBaseGestureTime = now
+            }
+            return staticPose
+        }
+        return null
+    }
+
+    private fun evaluateStaticPoseOnly(sk: FloatArray): String? {
+        val prefs = context.getSharedPreferences("aura_prefs", Context.MODE_PRIVATE)
+        val sensitivityMode = prefs.getString("sensitivity_mode", "auto") ?: "auto"
+        val sensitivityValue = prefs.getFloat("sensitivity_value", 0.5f)
+
+        val handSize = jointDistance(0, 9, sk)
+        if (handSize < 0.03f) return null
+
+        val pinchThreshold = if (sensitivityMode == "auto") {
+            (handSize * 0.22f).coerceIn(0.025f, 0.055f)
+        } else {
+            0.02f + (sensitivityValue * 0.05f)
+        }
+
+        // Relative distance vector checks
+        val isIndexRaised = sk[8 * 2 + 1] < sk[6 * 2 + 1] && jointDistance(0, 8, sk) > jointDistance(0, 6, sk) * 1.05f
+        val isMiddleRaised = sk[12 * 2 + 1] < sk[10 * 2 + 1] && jointDistance(0, 12, sk) > jointDistance(0, 10, sk) * 1.05f
+        val isRingRaised = sk[16 * 2 + 1] < sk[14 * 2 + 1] && jointDistance(0, 16, sk) > jointDistance(0, 14, sk) * 1.05f
+        val isPinkyRaised = sk[20 * 2 + 1] < sk[18 * 2 + 1] && jointDistance(0, 20, sk) > jointDistance(0, 18, sk) * 1.05f
+        val isThumbRaised = jointDistance(4, 9, sk) > jointDistance(2, 9, sk) * 1.15f
+
+        // Pinch distances
+        val indexPinchDist = jointDistance(4, 8, sk)
+        val middlePinchDist = jointDistance(4, 12, sk)
+        val ringPinchDist = jointDistance(4, 16, sk)
+        val pinkyPinchDist = jointDistance(4, 20, sk)
+
+        // 1. PINCH CATEGORY
+        if (indexPinchDist < pinchThreshold) return "INDEX_PINCH"
+        if (middlePinchDist < pinchThreshold) return "MIDDLE_PINCH"
+        if (ringPinchDist < pinchThreshold) return "RING_PINCH"
+        if (pinkyPinchDist < pinchThreshold) return "PINKY_PINCH"
+
+        // 2. OPEN HAND CATEGORY
+        if (isIndexRaised && isMiddleRaised && isRingRaised && isPinkyRaised) {
+            return "OPEN_PALM"
+        }
+
+        // 3. CLOSED HAND CATEGORY
+        if (!isIndexRaised && !isMiddleRaised && !isRingRaised && !isPinkyRaised) {
+            return "FIST"
+        }
+        if (isIndexRaised && isMiddleRaised && !isRingRaised && !isPinkyRaised) {
+            return "PEACE_SIGN"
+        }
+        if (isIndexRaised && !isMiddleRaised && !isRingRaised && isPinkyRaised) {
+            return "ROCK_ON"
+        }
+        if (isThumbRaised && !isIndexRaised && !isMiddleRaised && !isRingRaised && !isPinkyRaised) {
+            return if (sk[4 * 2 + 1] < sk[17 * 2 + 1]) "THUMBS_UP" else "THUMBS_DOWN"
+        }
+
+        // 4. FINGER RAISE CATEGORY
+        if (isIndexRaised && isMiddleRaised) {
+            return "INDEX_MIDDLE_RAISED"
+        }
+        if (isIndexRaised && !isMiddleRaised && !isRingRaised && !isPinkyRaised) {
+            return "INDEX_RAISED"
+        }
+        if (!isIndexRaised && isMiddleRaised && !isRingRaised && !isPinkyRaised) {
+            return "MIDDLE_RAISED"
+        }
+        if (!isIndexRaised && !isMiddleRaised && !isRingRaised && isPinkyRaised) {
+            return "PINKY_RAISED"
+        }
+
+        return null
+    }
+
+    fun detectOnBitmap(bitmap: Bitmap): FloatArray? {
+        try {
+            initDetector()
+            val landmarker = handLandmarker ?: return null
+            val mpImage = BitmapImageBuilder(bitmap).build()
+            val result = landmarker.detect(mpImage)
+            val landmarksList = result.landmarks()
+            if (landmarksList.isNotEmpty()) {
+                val handLandmarks = landmarksList[0]
+                val skeleton = FloatArray(42)
+                for (i in 0 until 21) {
+                    if (i < handLandmarks.size) {
+                        val lm = handLandmarks[i]
+                        skeleton[i * 2] = lm.x()
+                        skeleton[i * 2 + 1] = lm.y()
+                    }
+                }
+                return skeleton
+            }
+        } catch (e: Exception) {
+            Log.e("GestureDetector", "Error in static bitmap analysis", e)
+        }
         return null
     }
 

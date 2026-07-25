@@ -1,4 +1,8 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import java.net.URL
+import java.io.BufferedInputStream
+import java.io.FileOutputStream
+
 
 plugins {
   alias(libs.plugins.android.application)
@@ -21,6 +25,7 @@ android {
     versionName = "1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
   }
 
   signingConfigs {
@@ -56,7 +61,15 @@ android {
     compose = true
     buildConfig = true
   }
+  androidResources {
+    noCompress += "task"
+  }
   testOptions { unitTests { isIncludeAndroidResources = true } }
+  packaging {
+    jniLibs {
+      useLegacyPackaging = true
+    }
+  }
 }
 
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
@@ -135,3 +148,49 @@ dependencies {
   "ksp"(libs.androidx.room.compiler)
   "ksp"(libs.moshi.kotlin.codegen)
 }
+
+tasks.register<Copy>("copyDebugApkToVisibleDir") {
+  from(layout.buildDirectory.dir("outputs/apk/debug"))
+  include("*.apk")
+  into(rootProject.layout.projectDirectory.dir("build-outputs"))
+}
+
+afterEvaluate {
+  tasks.named("assembleDebug").configure {
+    finalizedBy("copyDebugApkToVisibleDir")
+  }
+}
+
+tasks.register("ensureHandLandmarkerTask") {
+    val assetsDir = layout.projectDirectory.dir("src/main/assets").asFile
+    val taskFile = layout.projectDirectory.file("src/main/assets/hand_landmarker.task").asFile
+    
+    doLast {
+        if (!assetsDir.exists()) {
+            assetsDir.mkdirs()
+        }
+        val minExpectedSize = 7000000L // 7MB
+        if (!taskFile.exists() || taskFile.length() < minExpectedSize) {
+            println("Downloading hand_landmarker.task from MediaPipe repository...")
+            val url = URL("https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task")
+            BufferedInputStream(url.openStream()).use { input ->
+                FileOutputStream(taskFile).use { output ->
+                    val buffer = ByteArray(1024 * 64)
+                    while (true) {
+                        val bytesRead = input.read(buffer)
+                        if (bytesRead == -1) break
+                        output.write(buffer, 0, bytesRead)
+                    }
+                }
+            }
+            println("Download completed. File size: ${taskFile.length()} bytes")
+        } else {
+            println("hand_landmarker.task is already present with correct size: ${taskFile.length()} bytes")
+        }
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn("ensureHandLandmarkerTask")
+}
+
